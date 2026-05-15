@@ -326,67 +326,148 @@ class Predictor:
         }
 
 
+def send_gmail_alert(node_id, tilt, j2, j3, rain, final):
+    """Gui email canh bao qua Gmail SMTP."""
+    import smtplib
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.text import MIMEText
+
+    GMAIL_USER = "your_email@gmail.com"   # <- doi email cua ban
+    GMAIL_PASS = "your_app_password"       # <- doi App Password Gmail
+    ALERT_TO   = ["recipient@gmail.com"]   # <- doi email nhan
+
+    levels = {0: "AN TOAN", 1: "CANH BAO", 2: "NGUY HIEM!"}
+    subject = f"[SAT LO] {levels[final]} - {node_id} - {time.strftime('%d/%m %H:%M')}"
+    body = (
+        f"=== CANH BAO SAT LO DAT ===\n\n"
+        f"Node        : {node_id}\n"
+        f"Muc canh bao: {levels[final]}\n"
+        f"Goc nghieng : {tilt:.1f} do\n"
+        f"Do am mat   : {j2:.0f}%\n"
+        f"Do am sau   : {j3:.0f}%\n"
+        f"Mua         : {'Co' if rain else 'Khong'}\n"
+        f"Thoi gian   : {time.strftime('%d/%m/%Y %H:%M:%S')}\n\n"
+        f"Vui long kiem tra khu vuc ngay!"
+    )
+    try:
+        msg = MIMEMultipart()
+        msg['Subject'] = subject
+        msg['From']    = GMAIL_USER
+        msg['To']      = ', '.join(ALERT_TO)
+        msg.attach(MIMEText(body, 'plain'))
+        with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
+            server.login(GMAIL_USER, GMAIL_PASS)
+            server.sendmail(GMAIL_USER, ALERT_TO, msg.as_string())
+        print(f"  [EMAIL] Da gui canh bao!")
+    except Exception as e:
+        print(f"  [EMAIL] Loi: {e}")
+
+
 def run_predict():
     import serial
 
     p = Predictor()
 
-    print(f"[*] Kết nối Serial {SERIAL_PORT} @ {BAUD_RATE}...")
+    print(f"[*] Ket noi Serial {SERIAL_PORT} @ {BAUD_RATE}...")
     try:
         ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=2)
     except Exception as e:
-        print(f"[!] Không mở được cổng Serial: {e}")
-        print(f"    Kiểm tra cổng: ls /dev/tty*")
-        print(f"    Thử: /dev/ttyACM0 hoặc /dev/ttyUSB1")
+        print(f"[!] Khong mo duoc cong Serial: {e}")
+        print(f"    Kiem tra: ls /dev/tty*")
         return
 
-    time.sleep(2)  # chờ ESP32 khởi động
-    print("[OK] Serial kết nối!\n")
+    time.sleep(2)
+    print("[OK] Serial ket noi!\n")
     print("=" * 60)
-    print("  ĐANG GIÁM SÁT — nhấn Ctrl+C để dừng")
+    print("  DANG GIAM SAT — nhan Ctrl+C de dung")
     print("=" * 60)
+
+    node_states     = {}
+    last_alert_time = {}
+    ALERT_COOLDOWN  = 600  # 10 phut
 
     while True:
         try:
             line = ser.readline().decode("utf-8", errors="ignore").strip()
-
-            # Bỏ qua dòng trống hoặc không phải JSON
             if not line or not line.startswith("{"):
                 continue
 
-            # Parse JSON từ ESP32
-            # Dạng: {"id":1,"vs":0.25,"vd":0.30,"pt":0.12,"ro":0.05}
-            data = json.loads(line)
-            node_id = data.get("id", 0)
-            vs      = float(data.get("vs", 0))
-            vd      = float(data.get("vd", 0))
-            pt      = float(data.get("pt", 0))
-            ro      = float(data.get("ro", 0))
+            data     = json.loads(line)
+            msg_type = data.get("type", "")
 
-            # Dự đoán
-            t0 = time.time()
-            final, detail = p.predict_one(vs, vd, pt, ro)
-            ms = (time.time() - t0) * 1000
+            # ── Nhan du lieu tu Gateway ──────────────────────────
+            if msg_type == "data":
+                raw   = data.get("raw", "")
+                parts = raw.split(",")
+                if len(parts) < 6:
+                    continue
 
-            # In kết quả
-            status = LABELS[final]
-            print(f"\n[Node {node_id}] {time.strftime('%H:%M:%S')}")
-            print(f"  VMC_mat={vs:.3f}  VMC_sau={vd:.3f}  "
-                  f"Pitch={pt:.2f}°  Roll={ro:.2f}°")
-            print(f"  RF={detail['rf'][0]}({detail['rf'][1]*100:.0f}%)  "
-                  f"SVM={detail['svm'][0]}({detail['svm'][1]*100:.0f}%)  "
-                  f"LSTM={detail['lstm'][0]}({detail['lstm'][1]*100:.0f}%)")
-            print(f"  >>> {status}  [{ms:.0f}ms]")
+                # Format: N01,tilt,j2%,j3%,rain,alert
+                node_id    = parts[0]
+                tilt       = float(parts[1])
+                j2         = float(parts[2])
+                j3         = float(parts[3])
+                rain       = int(parts[4])
+                alert_node = int(parts[5])
 
-            # Gửi SMS nếu nguy hiểm (thêm code SIM800L vào đây)
-            if final >= 2:
-                print(f"  !!! CANH BAO: Gui SMS !!!")
-                # send_sms(f"Node {node_id}: NGUY HIEM! VMC={vs:.2f} Pitch={pt:.2f}")
+                # Chuyen sang dac trung AI (0.0-1.0)
+                vmc_s = j2 / 100.0
+                vmc_d = j3 / 100.0
+                pitch = tilt
+                roll  = 0.0
+
+                # Du doan AI
+                t0 = time.time()
+                final, detail = p.predict_one(vmc_s, vmc_d, pitch, roll)
+                ms = (time.time() - t0) * 1000
+
+                # Luu trang thai node
+                node_states[node_id] = {
+                    "tilt": tilt, "j2": j2, "j3": j3,
+                    "rain": rain, "alert_node": alert_node,
+                    "alert_ai": final,
+                    "time": time.strftime('%H:%M:%S')
+                }
+
+                # In ket qua
+                status   = LABELS[final]
+                rain_str = "Co mua" if rain else "Khong mua"
+                print(f"\n[{node_id}] {time.strftime('%H:%M:%S')}")
+                print(f"  VMC_mat={vmc_s:.3f}  VMC_sau={vmc_d:.3f}  "
+                      f"Pitch={pitch:.2f}  Roll={roll:.2f}")
+                print(f"  RF={detail['rf'][0]}({detail['rf'][1]*100:.0f}%)  "
+                      f"SVM={detail['svm'][0]}({detail['svm'][1]*100:.0f}%)  "
+                      f"LSTM={detail['lstm'][0]}({detail['lstm'][1]*100:.0f}%)")
+                print(f"  Node={alert_node}  AI={final}"
+                      f"  >>> {status}  [{ms:.0f}ms]")
+                print(f"  Tilt={tilt:.1f} J2={j2:.0f}% J3={j3:.0f}% {rain_str}")
+
+                # Gui Gmail neu can canh bao
+                now  = time.time()
+                last = last_alert_time.get(node_id, 0)
+                if (final >= 1 or alert_node >= 1) and \
+                   (now - last > ALERT_COOLDOWN):
+                    print(f"  !!! GUI GMAIL CANH BAO !!!")
+                    send_gmail_alert(node_id, tilt, j2, j3, rain, final)
+                    last_alert_time[node_id] = now
+
+            elif msg_type == "heartbeat":
+                print(f"[HB] Gateway hoat dong | count={data.get('count',0)}")
+
+            elif msg_type == "timeout":
+                print(f"[!] {data.get('node','?')} MAT KET NOI!")
+
+            elif msg_type == "status":
+                n1 = "ON" if data.get("n1") else "OFF"
+                n2 = "ON" if data.get("n2") else "OFF"
+                n3 = "ON" if data.get("n3") else "OFF"
+                print(f"[STATUS] N1={n1} N2={n2} N3={n3} "
+                      f"Alert={data.get('globalAlert',0)}")
 
         except json.JSONDecodeError:
-            pass  # bỏ qua dòng lỗi format
+            pass
         except KeyboardInterrupt:
-            print("\n[*] Dừng giám sát.")
+            print("\n[*] Dung giam sat.")
             ser.close()
             break
         except Exception as e:
