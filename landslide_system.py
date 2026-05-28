@@ -3,6 +3,7 @@
 # Raspberry Pi: Serial → SQLite → Firebase
 # Chạy: python3 landslide_gateway.py
 # Cài:  pip3 install pyserial firebase-admin
+# Cần:  serviceAccountKey.json cùng thư mục
 # =============================================
 
 import serial
@@ -74,7 +75,6 @@ def push_firebase(node_id, tilt, roll,
     try:
         levels = {0:"AN_TOAN", 1:"CANH_BAO", 2:"NGUY_HIEM"}
 
-        # Dữ liệu node
         db.reference(f'landslide/nodes/{node_id}').set({
             'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
             'tilt'     : round(tilt, 1),
@@ -86,7 +86,6 @@ def push_firebase(node_id, tilt, roll,
             'status'   : levels.get(alert, 'UNKNOWN')
         })
 
-        # Global alert
         db.reference('landslide/global').update({
             'lastUpdate'  : time.strftime('%Y-%m-%d %H:%M:%S'),
             'globalAlert' : alert
@@ -130,7 +129,6 @@ def main():
 
             # ── Nhận data từ Gateway v2 ───────────
             if msg_type == "data":
-                # Format mới: fields riêng lẻ
                 node_id = data.get("node",  "")
                 tilt    = float(data.get("tilt",  0))
                 roll    = float(data.get("roll",  0))
@@ -158,7 +156,7 @@ def main():
                         j2, j3, rain, alert)
                 print(f"  [DB] Luu OK")
 
-                # 2. Push Firebase (thread riêng)
+                # 2. Push Firebase
                 if fb_ok:
                     t = threading.Thread(
                         target=push_firebase,
