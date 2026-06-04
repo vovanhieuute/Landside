@@ -40,6 +40,23 @@ def init_db():
         )
     ''')
     conn.commit()
+
+    # ── Tự động migrate nếu bảng cũ thiếu cột ─
+    existing = {
+        row[1]
+        for row in conn.execute("PRAGMA table_info(sensor_data)")
+    }
+    migrations = {
+        "pitch" : "ALTER TABLE sensor_data ADD COLUMN pitch REAL    DEFAULT 0",
+        "tilt"  : "ALTER TABLE sensor_data ADD COLUMN tilt  REAL    DEFAULT 0",
+        "label" : "ALTER TABLE sensor_data ADD COLUMN label INTEGER DEFAULT -1",
+    }
+    for col, sql in migrations.items():
+        if col not in existing:
+            conn.execute(sql)
+            conn.commit()
+            print(f"[DB] Da them cot: {col}")
+
     print("[DB] SQLite OK!")
     return conn
 
@@ -94,7 +111,7 @@ def push_firebase(node_id, pitch, tilt, roll,
             'globalAlert' : alert
         })
 
-        print(f"  [Firebase] Push OK → {node_id} alert={alert}")
+        print(f"  [Firebase] Push OK -> {node_id} alert={alert}")
     except Exception as e:
         print(f"  [Firebase] Loi push: {e}")
 
@@ -102,7 +119,7 @@ def push_firebase(node_id, pitch, tilt, roll,
 def main():
     print("=" * 50)
     print("  LANDSLIDE GATEWAY — Raspberry Pi 4")
-    print("  Serial → SQLite → Firebase")
+    print("  Serial -> SQLite -> Firebase")
     print("=" * 50 + "\n")
 
     conn  = init_db()
@@ -130,7 +147,7 @@ def main():
             data     = json.loads(line)
             msg_type = data.get("type", "")
 
-            # ── Nhận data từ Gateway v2 ───────────
+            # ── Nhận data từ Gateway ──────────────
             if msg_type == "data":
                 node_id = data.get("node",  "")
                 pitch   = float(data.get("pitch", 0))
@@ -143,6 +160,9 @@ def main():
 
                 if not node_id:
                     continue
+
+                # Đảm bảo tilt luôn dương
+                tilt = abs(tilt)
 
                 levels = {0:"AN TOAN",
                           1:"CANH BAO",
