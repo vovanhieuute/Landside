@@ -2,7 +2,7 @@
 # landslide_gateway.py
 # Raspberry Pi: Serial → SQLite → Firebase
 # Chạy: python3 landslide_gateway.py
-# Cài:  pip3 install pyserial firebase-admin
+# Cài:  pip3 install pyserial firebase-admin pandas
 # Cần:  serviceAccountKey.json cùng thư mục
 # =============================================
 
@@ -20,6 +20,7 @@ BAUD_RATE     = 115200
 DB_PATH       = "landslide.db"
 FIREBASE_CRED = "serviceAccountKey.json"
 FIREBASE_URL  = "https://landside-cf537-default-rtdb.firebaseio.com"
+CSV_PATH      = "train_data.csv"
 
 # ─────────────────────────────────────────────
 def init_db():
@@ -64,16 +65,50 @@ def init_db():
 def save_db(conn, node_id, pitch, tilt, roll,
             j2, j3, rain, alert):
     try:
+        # Gán nhãn theo pitch
+        p = abs(pitch)
+        if   p < 0.5:  label = 0   # An toan
+        elif p < 1.5:  label = 1   # Small
+        else:          label = 2   # Medium
+
         conn.execute(
             "INSERT INTO sensor_data "
-            "(timestamp,node_id,pitch,tilt,roll,j2,j3,rain,alert) "
-            "VALUES (?,?,?,?,?,?,?,?,?)",
+            "(timestamp,node_id,pitch,tilt,roll,"
+            "j2,j3,rain,alert,label) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
             (time.strftime('%Y-%m-%d %H:%M:%S'),
-             node_id, pitch, tilt, roll, j2, j3, rain, alert)
+             node_id, pitch, tilt, roll,
+             j2, j3, rain, alert, label)
         )
         conn.commit()
     except Exception as e:
         print(f"  [DB] Loi luu: {e}")
+
+# ─────────────────────────────────────────────
+def export_csv(conn):
+    try:
+        import pandas as pd
+        df = pd.read_sql_query(
+            "SELECT timestamp, node_id, "
+            "pitch, roll, tilt, j2, j3, rain, alert, label "
+            "FROM sensor_data "
+            "ORDER BY timestamp ASC",
+            conn
+        )
+        df.to_csv(CSV_PATH, index=False)
+        total  = len(df)
+        c0 = len(df[df['label']==0])
+        c1 = len(df[df['label']==1])
+        c2 = len(df[df['label']==2])
+        print(f"\n[CSV] Xuat thanh cong: {CSV_PATH}")
+        print(f"  Tong: {total} mau")
+        print(f"  Label 0 (An toan) : {c0}")
+        print(f"  Label 1 (Small)   : {c1}")
+        print(f"  Label 2 (Medium)  : {c2}\n")
+    except ImportError:
+        print("[CSV] Cai pandas: pip3 install pandas")
+    except Exception as e:
+        print(f"[CSV] Loi: {e}")
 
 # ─────────────────────────────────────────────
 def init_firebase():
@@ -120,6 +155,7 @@ def main():
     print("=" * 50)
     print("  LANDSLIDE GATEWAY — Raspberry Pi 4")
     print("  Serial -> SQLite -> Firebase")
+    print("  Lenh: 'csv' de xuat train_data.csv")
     print("=" * 50 + "\n")
 
     conn  = init_db()
@@ -134,10 +170,41 @@ def main():
         return
 
     time.sleep(2)
-    print("[OK] San sang nhan du lieu!\n")
+    print("[OK] San sang nhan du lieu!")
+    print("[*]  Nhan Ctrl+C de dung, nhap 'csv' de xuat CSV\n")
+
+    # ── Thread nhận lệnh từ bàn phím ──────────
+    def keyboard_thread():
+        while True:
+            try:
+                cmd = input().strip().lower()
+                if cmd == "csv":
+                    export_csv(conn)
+                elif cmd == "exit" or cmd == "quit":
+                    print("[*] Dung chuong trinh.")
+                    import os; os._exit(0)
+                elif cmd == "status":
+                    rows = conn.execute(
+                        "SELECT COUNT(*) FROM sensor_data"
+                    ).fetchone()
+                    print(f"[DB] Tong so ban ghi: {rows[0]}\n")
+            except:
+                break
+
+    t_kb = threading.Thread(
+        target=keyboard_thread, daemon=True)
+    t_kb.start()
+
+    # ── Xuất CSV tự động mỗi 1 giờ ────────────
+    last_auto_csv = time.time()
 
     while True:
         try:
+            # Auto export CSV mỗi 1 giờ
+            if time.time() - last_auto_csv >= 3600:
+                export_csv(conn)
+                last_auto_csv = time.time()
+
             line = ser.readline().decode(
                 "utf-8", errors="ignore").strip()
 
@@ -161,14 +228,12 @@ def main():
                 if not node_id:
                     continue
 
-                # Đảm bảo tilt luôn dương
                 tilt = abs(tilt)
 
                 levels = {0:"AN TOAN",
                           1:"CANH BAO",
                           2:"NGUY HIEM!"}
 
-                # In terminal
                 print(f"[{node_id}] {time.strftime('%H:%M:%S')}")
                 print(f"  Pitch={pitch:.1f}  Tilt={tilt:.1f}  "
                       f"Roll={roll:.1f}  "
@@ -176,12 +241,10 @@ def main():
                       f"Mua={'Co' if rain else 'Khong'}")
                 print(f"  >>> {levels.get(alert, '?')}")
 
-                # 1. Lưu SQLite
                 save_db(conn, node_id, pitch, tilt, roll,
                         j2, j3, rain, alert)
                 print(f"  [DB] Luu OK")
 
-                # 2. Push Firebase
                 if fb_ok:
                     t = threading.Thread(
                         target=push_firebase,
@@ -232,6 +295,7 @@ def main():
             pass
         except KeyboardInterrupt:
             print("\n[*] Dung chuong trinh.")
+            export_csv(conn)
             ser.close()
             conn.close()
             break
