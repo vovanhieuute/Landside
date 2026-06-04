@@ -29,12 +29,14 @@ def init_db():
             id        INTEGER PRIMARY KEY AUTOINCREMENT,
             timestamp TEXT    NOT NULL,
             node_id   TEXT    NOT NULL,
+            pitch     REAL    DEFAULT 0,
             tilt      REAL    DEFAULT 0,
             roll      REAL    DEFAULT 0,
             j2        REAL    DEFAULT 0,
             j3        REAL    DEFAULT 0,
             rain      INTEGER DEFAULT 0,
-            alert     INTEGER DEFAULT 0
+            alert     INTEGER DEFAULT 0,
+            label     INTEGER DEFAULT -1
         )
     ''')
     conn.commit()
@@ -42,15 +44,15 @@ def init_db():
     return conn
 
 # ─────────────────────────────────────────────
-def save_db(conn, node_id, tilt, roll,
+def save_db(conn, node_id, pitch, tilt, roll,
             j2, j3, rain, alert):
     try:
         conn.execute(
             "INSERT INTO sensor_data "
-            "(timestamp,node_id,tilt,roll,j2,j3,rain,alert) "
-            "VALUES (?,?,?,?,?,?,?,?)",
+            "(timestamp,node_id,pitch,tilt,roll,j2,j3,rain,alert) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
             (time.strftime('%Y-%m-%d %H:%M:%S'),
-             node_id, tilt, roll, j2, j3, rain, alert)
+             node_id, pitch, tilt, roll, j2, j3, rain, alert)
         )
         conn.commit()
     except Exception as e:
@@ -70,17 +72,18 @@ def init_firebase():
         return False
 
 # ─────────────────────────────────────────────
-def push_firebase(node_id, tilt, roll,
+def push_firebase(node_id, pitch, tilt, roll,
                   j2, j3, rain, alert):
     try:
         levels = {0:"AN_TOAN", 1:"CANH_BAO", 2:"NGUY_HIEM"}
 
         db.reference(f'landslide/nodes/{node_id}').set({
             'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
-            'tilt'     : round(tilt, 1),
-            'roll'     : round(roll, 1),
-            'j2'       : round(j2,   1),
-            'j3'       : round(j3,   1),
+            'pitch'    : round(pitch, 1),
+            'tilt'     : round(tilt,  1),
+            'roll'     : round(roll,  1),
+            'j2'       : round(j2,    1),
+            'j3'       : round(j3,    1),
             'rain'     : rain,
             'alert'    : alert,
             'status'   : levels.get(alert, 'UNKNOWN')
@@ -130,6 +133,7 @@ def main():
             # ── Nhận data từ Gateway v2 ───────────
             if msg_type == "data":
                 node_id = data.get("node",  "")
+                pitch   = float(data.get("pitch", 0))
                 tilt    = float(data.get("tilt",  0))
                 roll    = float(data.get("roll",  0))
                 j2      = float(data.get("j2",    0))
@@ -146,13 +150,14 @@ def main():
 
                 # In terminal
                 print(f"[{node_id}] {time.strftime('%H:%M:%S')}")
-                print(f"  Tilt={tilt:.1f}  Roll={roll:.1f}  "
+                print(f"  Pitch={pitch:.1f}  Tilt={tilt:.1f}  "
+                      f"Roll={roll:.1f}  "
                       f"J2={j2:.0f}%  J3={j3:.0f}%  "
                       f"Mua={'Co' if rain else 'Khong'}")
                 print(f"  >>> {levels.get(alert, '?')}")
 
                 # 1. Lưu SQLite
-                save_db(conn, node_id, tilt, roll,
+                save_db(conn, node_id, pitch, tilt, roll,
                         j2, j3, rain, alert)
                 print(f"  [DB] Luu OK")
 
@@ -160,7 +165,7 @@ def main():
                 if fb_ok:
                     t = threading.Thread(
                         target=push_firebase,
-                        args=(node_id, tilt, roll,
+                        args=(node_id, pitch, tilt, roll,
                               j2, j3, rain, alert),
                         daemon=True
                     )
