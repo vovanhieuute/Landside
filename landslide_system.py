@@ -27,13 +27,16 @@ node_online    = {"N01": False, "N02": False, "N03": False}
 
 # ── Đo hiệu năng ─────────────────────────────
 perf = {
-    "N01": {"sent": 0, "recv": 0,
+    "N01": {"sent": 0, "recv": 0, "lost": 0,
+            "seq_first": -1, "seq_last": -1,
             "seq_expected": 0, "latencies": [],
             "e2e": []},
-    "N02": {"sent": 0, "recv": 0,
+    "N02": {"sent": 0, "recv": 0, "lost": 0,
+            "seq_first": -1, "seq_last": -1,
             "seq_expected": 0, "latencies": [],
             "e2e": []},
-    "N03": {"sent": 0, "recv": 0,
+    "N03": {"sent": 0, "recv": 0, "lost": 0,
+            "seq_first": -1, "seq_last": -1,
             "seq_expected": 0, "latencies": [],
             "e2e": []},
 }
@@ -140,24 +143,29 @@ def print_perf_report():
 
     for nid, p in perf.items():
         recv = p["recv"]
-        sent = p["seq_expected"]
-        if sent == 0:
+        sent = p["sent"]
+        lost = p["lost"]
+        if recv == 0:
             continue
 
-        plr  = (sent - recv) / sent * 100 if sent > 0 else 0
-        rel  = recv / sent * 100 if sent > 0 else 0
+        plr  = (lost / (sent) * 100) if sent > 0 else 0
+        rel  = (recv / sent * 100)   if sent > 0 else 0
+        # Giới hạn hợp lệ
+        plr  = max(0.0, min(plr,  100.0))
+        rel  = max(0.0, min(rel,  100.0))
 
         lats = p["latencies"]
         avg_lat = sum(lats) / len(lats) if lats else 0
-        max_lat = max(lats) if lats else 0
+        max_lat = max(lats)             if lats else 0
 
         e2es = p["e2e"]
         avg_e2e = sum(e2es) / len(e2es) if e2es else 0
-        max_e2e = max(e2es) if e2es else 0
+        max_e2e = max(e2es)             if e2es else 0
 
         print(f"\n  [{nid}]")
-        print(f"  Goi gui (uoc tinh) : {sent}")
+        print(f"  Goi gui (seq)      : {sent}")
         print(f"  Goi nhan           : {recv}")
+        print(f"  Goi mat            : {lost}")
         print(f"  PLR                : {plr:.2f}%")
         print(f"  Reliability        : {rel:.2f}%")
         if lats:
@@ -357,11 +365,14 @@ def main():
                 node_online[node_id]    = True
 
                 # Đo latency (gateway → Pi)
-                latency_ms = 0.0
-                if ts_gw > 0:
-                    latency_ms = (t_recv * 1000) - ts_gw
-                    if latency_ms < 0:
-                        latency_ms = 0
+                # ts_gw là millis() từ ESP32 (ms kể từ khi boot)
+                # KHÔNG thể trừ trực tiếp với Unix timestamp
+                # → Dùng thời gian nhận serial thay thế
+                # Latency thực = thời gian từ lúc gói đến Serial
+                # đến lúc Python xử lý xong (~vài ms)
+                latency_ms = (time.time() - t_recv) * 1000
+                if latency_ms < 0:
+                    latency_ms = 0
 
                 # Đo E2E (tính từ lúc push Firebase xong)
                 t_e2e_start = time.time()
@@ -370,16 +381,21 @@ def main():
                 p = perf[node_id]
                 p["recv"] += 1
                 if seq >= 0:
-                    if p["seq_expected"] == 0:
-                        p["seq_expected"] = seq
+                    if p["seq_first"] == -1:
+                        p["seq_first"] = seq
+                        p["seq_expected"] = seq + 1
                     else:
-                        gap = seq - p["seq_expected"]
-                        if gap > 1:
+                        if seq > p["seq_expected"]:
+                            lost = seq - p["seq_expected"]
+                            p["lost"] += lost
                             print(f"  [PLR] {node_id} mat "
-                                  f"{gap-1} goi "
+                                  f"{lost} goi "
                                   f"(seq {p['seq_expected']}"
                                   f"→{seq})")
-                    p["seq_expected"] = seq + 1
+                        p["seq_expected"] = seq + 1
+                    p["seq_last"] = seq
+                    # Tổng gói gửi = seq cuối - seq đầu + 1
+                    p["sent"] = p["seq_last"] - p["seq_first"] + 1
 
                 if latency_ms > 0:
                     p["latencies"].append(latency_ms)
