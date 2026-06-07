@@ -61,10 +61,10 @@ def send_alert_email(node_id, alert, pitch, tilt, j2, j3, rain):
     global last_email_time, last_email_level
     if not EMAIL_ENABLED:
         return
-    now = time.time()
-    if alert <= last_email_level and now - last_email_time < EMAIL_COOLDOWN:
-        return
     if alert == 0:
+        last_email_level = -1
+        return
+    if alert <= last_email_level:
         return
 
     levels = {1: "CANH BAO", 2: "NGUY HIEM"}
@@ -112,7 +112,6 @@ def send_alert_email(node_id, alert, pitch, tilt, j2, j3, rain):
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
             smtp.login(EMAIL_SENDER, EMAIL_PASSWORD)
             smtp.sendmail(EMAIL_SENDER, EMAIL_RECEIVER, msg.as_string())
-        last_email_time  = now
         last_email_level = alert
         print(f"  [EMAIL] Gui OK -> {', '.join(EMAIL_RECEIVER)} (muc {alert})")
     except Exception as e:
@@ -316,7 +315,7 @@ def check_node_timeout(fb_ok):
         now = time.time()
         for nid in ["N01", "N02", "N03"]:
             last = node_last_seen[nid]
-            if last > 0 and now - last > 35:
+            if last > 0 and now - last > 300:
                 if node_online[nid]:
                     node_online[nid] = False
                     print(f"[TIMEOUT] {nid} mat ket noi!\n")
