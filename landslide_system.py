@@ -27,7 +27,10 @@ CSV_PATH      = "train_data.csv"
 # ── Cấu hình Gmail ───────────────────────────
 EMAIL_SENDER   = "cauuthovohoaichau@gmail.com"    # Gmail gui
 EMAIL_PASSWORD = "sqdr xpsb tvjs flgf"    # App Password Gmail
-EMAIL_RECEIVER = "vovanhieuute@gmail.com"     # Email nhan canh bao
+EMAIL_RECEIVER = [                            # Danh sach email nhan canh bao
+    "vovanhieuute@gmail.com",
+    "22139021@student.hcmute.edu.vn",
+]
 EMAIL_ENABLED  = True                     # Tat/bat email
 EMAIL_COOLDOWN = 600                      # Toi thieu 10 phut/email
 
@@ -94,7 +97,7 @@ def send_alert_email(node_id, alert, pitch, tilt, j2, j3, rain):
       <td style="padding:8px;color:#666">Thoi gian</td>
       <td style="padding:8px">{time.strftime("%d/%m/%Y %H:%M:%S")}</td></tr>
 </table>
-{"<p style=\"color:red;font-weight:bold\">⚠ NGUY HIEM — Kiem tra khu vuc ngay!</p>" if alert == 2 else "<p style=\"color:#FF8C00\">Theo doi chat tinh trang mai doc.</p>"}
+{('<p style="color:red;font-weight:bold">⚠ NGUY HIEM — Kiem tra khu vuc ngay!</p>' if alert == 2 else '<p style="color:#FF8C00">Theo doi chat tinh trang mai doc.</p>')}
 <p style="color:#999;font-size:12px;margin-top:16px">
   He thong canh bao sat lo dat — HCMUTE — Vo Van Hieu 22139021
 </p>
@@ -104,14 +107,14 @@ def send_alert_email(node_id, alert, pitch, tilt, j2, j3, rain):
         msg = MIMEMultipart("alternative")
         msg["Subject"] = subject
         msg["From"]    = EMAIL_SENDER
-        msg["To"]      = EMAIL_RECEIVER
+        msg["To"]      = ", ".join(EMAIL_RECEIVER)
         msg.attach(MIMEText(body, "html", "utf-8"))
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
             smtp.login(EMAIL_SENDER, EMAIL_PASSWORD)
             smtp.sendmail(EMAIL_SENDER, EMAIL_RECEIVER, msg.as_string())
         last_email_time  = now
         last_email_level = alert
-        print(f"  [EMAIL] Gui OK -> {EMAIL_RECEIVER} (muc {alert})")
+        print(f"  [EMAIL] Gui OK -> {', '.join(EMAIL_RECEIVER)} (muc {alert})")
     except Exception as e:
         print(f"  [EMAIL] Loi: {e}")
 
