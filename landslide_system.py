@@ -10,6 +10,9 @@ import time
 import sqlite3
 import threading
 import psutil
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 import firebase_admin
 from firebase_admin import credentials, db
 
@@ -20,6 +23,17 @@ DB_PATH       = "landslide.db"
 FIREBASE_CRED = "serviceAccountKey.json"
 FIREBASE_URL  = "https://landside-cf537-default-rtdb.firebaseio.com"
 CSV_PATH      = "train_data.csv"
+
+# ── Cấu hình Gmail ───────────────────────────
+EMAIL_SENDER   = "cauuthovohoaichau@gmail.com"    # Gmail gui
+EMAIL_PASSWORD = "sqdr xpsb tvjs flgf"    # App Password Gmail
+EMAIL_RECEIVER = "vovanhieuute@gmail.com"     # Email nhan canh bao
+EMAIL_ENABLED  = True                     # Tat/bat email
+EMAIL_COOLDOWN = 600                      # Toi thieu 10 phut/email
+
+# ── Theo dõi email ────────────────────────────
+last_email_time  = 0
+last_email_level = -1
 
 # ── Theo dõi node ─────────────────────────────
 node_last_seen = {"N01": 0, "N02": 0, "N03": 0}
@@ -37,6 +51,69 @@ perf = {
             "seq_prev": -1,
             "latencies": [], "e2e": []},
 }
+
+
+# ── Gửi email cảnh báo ───────────────────────
+def send_alert_email(node_id, alert, pitch, tilt, j2, j3, rain):
+    global last_email_time, last_email_level
+    if not EMAIL_ENABLED:
+        return
+    now = time.time()
+    if alert <= last_email_level and now - last_email_time < EMAIL_COOLDOWN:
+        return
+    if alert == 0:
+        return
+
+    levels = {1: "CANH BAO", 2: "NGUY HIEM"}
+    emoji  = {1: "⚠️", 2: "🚨"}
+    colors = {1: "#FF8C00", 2: "#FF0000"}
+
+    subject = f"{emoji.get(alert,'⚠️')} [{levels.get(alert,'?')}] Sat lo dat - {node_id}"
+    body = f"""
+<html><body style="font-family:Arial;background:#f5f5f5;padding:20px">
+<div style="background:#fff;border-radius:8px;padding:24px;max-width:500px;
+     margin:auto;border-left:6px solid {colors.get(alert,'#FF8C00')}">
+<h2 style="color:{colors.get(alert,'#FF8C00')};margin-top:0">
+  {emoji.get(alert,'⚠️')} CANH BAO SAT LO DAT
+</h2>
+<table style="width:100%;border-collapse:collapse">
+  <tr><td style="padding:8px;color:#666">Node</td>
+      <td style="padding:8px;font-weight:bold">{node_id}</td></tr>
+  <tr style="background:#f9f9f9">
+      <td style="padding:8px;color:#666">Muc canh bao</td>
+      <td style="padding:8px;font-weight:bold;color:{colors.get(alert,'#FF8C00')}">
+        {levels.get(alert,'?')}</td></tr>
+  <tr><td style="padding:8px;color:#666">Goc nghieng</td>
+      <td style="padding:8px">Pitch={pitch:.1f}°  Tilt={tilt:.1f}°</td></tr>
+  <tr style="background:#f9f9f9">
+      <td style="padding:8px;color:#666">Do am dat</td>
+      <td style="padding:8px">J2={j2:.0f}%  J3={j3:.0f}%</td></tr>
+  <tr><td style="padding:8px;color:#666">Mua</td>
+      <td style="padding:8px">{"CO MUA" if rain else "KHONG MUA"}</td></tr>
+  <tr style="background:#f9f9f9">
+      <td style="padding:8px;color:#666">Thoi gian</td>
+      <td style="padding:8px">{time.strftime("%d/%m/%Y %H:%M:%S")}</td></tr>
+</table>
+{"<p style=\"color:red;font-weight:bold\">⚠ NGUY HIEM — Kiem tra khu vuc ngay!</p>" if alert == 2 else "<p style=\"color:#FF8C00\">Theo doi chat tinh trang mai doc.</p>"}
+<p style="color:#999;font-size:12px;margin-top:16px">
+  He thong canh bao sat lo dat — HCMUTE — Vo Van Hieu 22139021
+</p>
+</div></body></html>
+"""
+    try:
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = subject
+        msg["From"]    = EMAIL_SENDER
+        msg["To"]      = EMAIL_RECEIVER
+        msg.attach(MIMEText(body, "html", "utf-8"))
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
+            smtp.login(EMAIL_SENDER, EMAIL_PASSWORD)
+            smtp.sendmail(EMAIL_SENDER, EMAIL_RECEIVER, msg.as_string())
+        last_email_time  = now
+        last_email_level = alert
+        print(f"  [EMAIL] Gui OK -> {EMAIL_RECEIVER} (muc {alert})")
+    except Exception as e:
+        print(f"  [EMAIL] Loi: {e}")
 
 # ── SQLite ────────────────────────────────────
 def init_db():
@@ -392,6 +469,15 @@ def main():
                         roll, j2, j3, rain, alert,
                         latency_ms, 0)
                 print(f"  [DB] Luu OK")
+
+                # Gửi email cảnh báo
+                if alert > 0:
+                    threading.Thread(
+                        target=send_alert_email,
+                        args=(node_id, alert, pitch,
+                              tilt, j2, j3, rain),
+                        daemon=True
+                    ).start()
 
                 if fb_ok:
                     def push_and_measure(nid, p_, t_, r_,
