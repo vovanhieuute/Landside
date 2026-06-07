@@ -35,8 +35,7 @@ EMAIL_ENABLED  = True                     # Tat/bat email
 EMAIL_COOLDOWN = 600                      # Toi thieu 10 phut/email
 
 # ── Theo dõi email ────────────────────────────
-last_email_time  = 0
-last_email_level = -1
+last_email_level = {"N01": -1, "N02": -1, "N03": -1}
 
 # ── Theo dõi node ─────────────────────────────
 node_last_seen = {"N01": 0, "N02": 0, "N03": 0}
@@ -58,13 +57,12 @@ perf = {
 
 # ── Gửi email cảnh báo ───────────────────────
 def send_alert_email(node_id, alert, pitch, tilt, j2, j3, rain):
-    global last_email_time, last_email_level
     if not EMAIL_ENABLED:
         return
     if alert == 0:
-        last_email_level = -1
+        last_email_level[node_id] = -1
         return
-    if alert <= last_email_level:
+    if alert <= last_email_level.get(node_id, -1):
         return
 
     levels = {1: "CANH BAO", 2: "NGUY HIEM"}
@@ -112,7 +110,7 @@ def send_alert_email(node_id, alert, pitch, tilt, j2, j3, rain):
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
             smtp.login(EMAIL_SENDER, EMAIL_PASSWORD)
             smtp.sendmail(EMAIL_SENDER, EMAIL_RECEIVER, msg.as_string())
-        last_email_level = alert
+        last_email_level[node_id] = alert
         print(f"  [EMAIL] Gui OK -> {', '.join(EMAIL_RECEIVER)} (muc {alert})")
     except Exception as e:
         print(f"  [EMAIL] Loi: {e}")
