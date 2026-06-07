@@ -27,18 +27,15 @@ node_online    = {"N01": False, "N02": False, "N03": False}
 
 # ── Đo hiệu năng ─────────────────────────────
 perf = {
-    "N01": {"sent": 0, "recv": 0, "lost": 0,
-            "seq_first": -1, "seq_last": -1,
-            "seq_expected": 0, "latencies": [],
-            "e2e": []},
-    "N02": {"sent": 0, "recv": 0, "lost": 0,
-            "seq_first": -1, "seq_last": -1,
-            "seq_expected": 0, "latencies": [],
-            "e2e": []},
-    "N03": {"sent": 0, "recv": 0, "lost": 0,
-            "seq_first": -1, "seq_last": -1,
-            "seq_expected": 0, "latencies": [],
-            "e2e": []},
+    "N01": {"recv": 0, "lost": 0,
+            "seq_prev": -1,
+            "latencies": [], "e2e": []},
+    "N02": {"recv": 0, "lost": 0,
+            "seq_prev": -1,
+            "latencies": [], "e2e": []},
+    "N03": {"recv": 0, "lost": 0,
+            "seq_prev": -1,
+            "latencies": [], "e2e": []},
 }
 
 # ── SQLite ────────────────────────────────────
@@ -143,16 +140,13 @@ def print_perf_report():
 
     for nid, p in perf.items():
         recv = p["recv"]
-        sent = p["sent"]
         lost = p["lost"]
         if recv == 0:
             continue
 
-        plr  = (lost / (sent) * 100) if sent > 0 else 0
-        rel  = (recv / sent * 100)   if sent > 0 else 0
-        # Giới hạn hợp lệ
-        plr  = max(0.0, min(plr,  100.0))
-        rel  = max(0.0, min(rel,  100.0))
+        sent = recv + lost
+        plr  = (lost / sent * 100) if sent > 0 else 0.0
+        rel  = (recv / sent * 100) if sent > 0 else 0.0
 
         lats = p["latencies"]
         avg_lat = sum(lats) / len(lats) if lats else 0
@@ -163,9 +157,9 @@ def print_perf_report():
         max_e2e = max(e2es)             if e2es else 0
 
         print(f"\n  [{nid}]")
-        print(f"  Goi gui (seq)      : {sent}")
         print(f"  Goi nhan           : {recv}")
-        print(f"  Goi mat            : {lost}")
+        print(f"  Goi mat (uoc tinh) : {lost}")
+        print(f"  Tong (uoc tinh)    : {sent}")
         print(f"  PLR                : {plr:.2f}%")
         print(f"  Reliability        : {rel:.2f}%")
         if lats:
@@ -175,7 +169,6 @@ def print_perf_report():
             print(f"  E2E trung binh     : {avg_e2e:.1f} ms")
             print(f"  E2E max            : {max_e2e:.1f} ms")
 
-    # CPU/RAM
     cpu = psutil.cpu_percent(interval=1)
     ram = psutil.virtual_memory()
     print(f"\n  CPU Usage : {cpu:.1f}%")
@@ -291,7 +284,6 @@ def main():
     time.sleep(2)
     print("[OK] San sang!\n")
 
-    # Threads
     threading.Thread(
         target=check_node_timeout,
         args=(fb_ok,), daemon=True).start()
@@ -299,7 +291,6 @@ def main():
         target=resource_monitor,
         daemon=True).start()
 
-    # Keyboard thread
     def keyboard_thread():
         while True:
             try:
@@ -328,7 +319,6 @@ def main():
 
     while True:
         try:
-            # Auto CSV mỗi 1 giờ
             if time.time() - last_auto_csv >= 3600:
                 export_csv(conn)
                 last_auto_csv = time.time()
@@ -341,7 +331,6 @@ def main():
             data     = json.loads(line)
             msg_type = data.get("type", "")
 
-            # ── DATA ──────────────────────────────
             if msg_type == "data":
                 t_recv   = time.time()
                 node_id  = data.get("node",  "")
@@ -359,43 +348,30 @@ def main():
                     continue
 
                 tilt = abs(tilt)
-
-                # Cập nhật last seen
                 node_last_seen[node_id] = t_recv
                 node_online[node_id]    = True
 
-                # Đo latency (gateway → Pi)
-                # ts_gw là millis() từ ESP32 (ms kể từ khi boot)
-                # KHÔNG thể trừ trực tiếp với Unix timestamp
-                # → Dùng thời gian nhận serial thay thế
-                # Latency thực = thời gian từ lúc gói đến Serial
-                # đến lúc Python xử lý xong (~vài ms)
                 latency_ms = (time.time() - t_recv) * 1000
                 if latency_ms < 0:
                     latency_ms = 0
 
-                # Đo E2E (tính từ lúc push Firebase xong)
                 t_e2e_start = time.time()
 
-                # Đo PLR qua seq number
                 p = perf[node_id]
                 p["recv"] += 1
                 if seq >= 0:
-                    if p["seq_first"] == -1:
-                        p["seq_first"] = seq
-                        p["seq_expected"] = seq + 1
-                    else:
-                        if seq > p["seq_expected"]:
-                            lost = seq - p["seq_expected"]
+                    prev = p["seq_prev"]
+                    if prev >= 0:
+                        if seq < prev:
+                            print(f"  [PLR] {node_id} seq reset "
+                                  f"({prev}→{seq})")
+                        elif seq > prev + 1:
+                            lost = seq - prev - 1
                             p["lost"] += lost
                             print(f"  [PLR] {node_id} mat "
                                   f"{lost} goi "
-                                  f"(seq {p['seq_expected']}"
-                                  f"→{seq})")
-                        p["seq_expected"] = seq + 1
-                    p["seq_last"] = seq
-                    # Tổng gói gửi = seq cuối - seq đầu + 1
-                    p["sent"] = p["seq_last"] - p["seq_first"] + 1
+                                  f"(seq {prev+1}→{seq-1})")
+                    p["seq_prev"] = seq
 
                 if latency_ms > 0:
                     p["latencies"].append(latency_ms)
@@ -412,13 +388,11 @@ def main():
                     print(f"  Latency={latency_ms:.0f}ms")
                 print(f"  >>> {levels.get(alert, '?')}")
 
-                # Lưu DB
                 save_db(conn, node_id, seq, pitch, tilt,
                         roll, j2, j3, rain, alert,
                         latency_ms, 0)
                 print(f"  [DB] Luu OK")
 
-                # Push Firebase + đo E2E
                 if fb_ok:
                     def push_and_measure(nid, p_, t_, r_,
                                          j2_, j3_, ra_, al_,
@@ -439,7 +413,6 @@ def main():
 
                 print()
 
-            # ── HEARTBEAT ─────────────────────────
             elif msg_type == "heartbeat":
                 count = data.get("count", 0)
                 print(f"[HB] Gateway OK | {count} ban tin\n")
@@ -453,7 +426,6 @@ def main():
                     except:
                         pass
 
-            # ── TIMEOUT ───────────────────────────
             elif msg_type == "timeout":
                 nid = data.get("node", "?")
                 print(f"[!] {nid} MAT KET NOI!\n")
@@ -463,7 +435,6 @@ def main():
                         args=(nid,), daemon=True
                     ).start()
 
-            # ── STATUS ────────────────────────────
             elif msg_type == "status":
                 n1 = "ON" if data.get("n1") else "OFF"
                 n2 = "ON" if data.get("n2") else "OFF"
