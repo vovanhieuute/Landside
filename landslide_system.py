@@ -271,18 +271,16 @@ def push_firebase(node_id, pitch, tilt, roll,
                   j2, j3, rain, alert):
     try:
         t_before = time.time()
-        levels = {0: "AN_TOAN", 1: "CANH_BAO", 2: "NGUY_HIEM"}
         db.reference(f'landslide/nodes/{node_id}').set({
-            'timestamp'  : time.strftime('%Y-%m-%d %H:%M:%S'),
-            'pitch'      : round(pitch, 1),
-            'tilt'       : round(tilt,  1),
-            'roll'       : round(roll,  1),
-            'j2'         : round(j2,    1),
-            'j3'         : round(j3,    1),
-            'rain'       : rain,
-            'alert'      : alert,
-            'status'     : 'online',
-            'status_text': levels.get(alert, 'UNKNOWN')
+            'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+            'pitch'    : round(pitch, 1),
+            'tilt'     : round(tilt,  1),
+            'roll'     : round(roll,  1),
+            'j2'       : round(j2,    1),
+            'j3'       : round(j3,    1),
+            'rain'     : rain,
+            'alert'    : alert,
+            'status'   : 'online',
         })
         db.reference('landslide/global').update({
             'lastUpdate' : time.strftime('%Y-%m-%d %H:%M:%S'),
@@ -301,7 +299,7 @@ def set_node_offline_firebase(nid):
             'timestamp'  : time.strftime('%Y-%m-%d %H:%M:%S'),
             'pitch'      : 0, 'tilt': 0, 'roll': 0,
             'j2'         : 0, 'j3' : 0, 'rain': 0,
-            'alert'      : 0, 'status_text': 'OFFLINE'
+            'alert'      : 0
         })
         print(f"  [Firebase] {nid} -> offline")
     except Exception as e:
