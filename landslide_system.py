@@ -7,6 +7,8 @@
 import serial
 import json
 import time
+import pickle
+import numpy as np
 import sqlite3
 import threading
 import psutil
@@ -33,6 +35,60 @@ EMAIL_RECEIVER = [                            # Danh sach email nhan canh bao
 ]
 EMAIL_ENABLED  = True                     # Tat/bat email
 EMAIL_COOLDOWN = 600                      # Toi thieu 10 phut/email
+
+# ── Cấu hình AI ──────────────────────────────
+AI_MODEL_PATH    = "rf_model.pkl"      # model phan loai hien tai
+AI_MODEL_PATH_5P = "rf_model_5p.pkl"   # model du bao som 5 phut
+AI_ENABLED       = True
+
+# ── Load model ────────────────────────────────
+ai_model    = None
+ai_model_5p = None
+
+def load_ai_model():
+    global ai_model, ai_model_5p
+    try:
+        with open(AI_MODEL_PATH, 'rb') as f:
+            ai_model = pickle.load(f)
+        print(f"[AI] Load model OK: {AI_MODEL_PATH}")
+    except Exception as e:
+        print(f"[AI] Loi load model: {e}")
+        ai_model = None
+    try:
+        with open(AI_MODEL_PATH_5P, 'rb') as f:
+            ai_model_5p = pickle.load(f)
+        print(f"[AI] Load model 5p OK: {AI_MODEL_PATH_5P}")
+    except Exception as e:
+        print(f"[AI] Khong co model 5p: {e}")
+        ai_model_5p = None
+
+def predict_ai_model(model_dict, tilt, pitch, roll, j2, j3, rain):
+    if model_dict is None:
+        return -1, "CHUA CO MODEL", 0.0
+    try:
+        tilt_abs      = abs(tilt)
+        roll_abs      = abs(roll)
+        moisture_avg  = (j2 + j3) / 2
+        moisture_diff = abs(j2 - j3)
+        tilt_moisture = tilt_abs * moisture_avg
+        X = np.array([[tilt, pitch, roll, j2, j3, rain,
+                       tilt_abs, roll_abs, moisture_avg,
+                       moisture_diff, tilt_moisture]])
+        rf, svm, xgb = model_dict['model']
+        scaler = model_dict['scaler']
+        X_s = scaler.transform(X)
+        prob = (rf.predict_proba(X)[0] +
+                svm.predict_proba(X_s)[0] +
+                xgb.predict_proba(X)[0]) / 3
+        label = int(np.argmax(prob))
+        conf  = float(prob[label]) * 100
+        names = ['AN TOAN', 'CANH BAO', 'NGUY HIEM']
+        return label, names[label], round(conf, 1)
+    except Exception as e:
+        print(f"[AI] Loi predict: {e}")
+        return -1, "LOI", 0.0
+
+
 
 # ── Theo dõi email ────────────────────────────
 last_email_level = {"N01": -1, "N02": -1, "N03": -1}
@@ -338,6 +394,7 @@ def resource_monitor():
 
 # ── Main ─────────────────────────────────────
 def main():
+    load_ai_model()
     print("=" * 55)
     print("  LANDSLIDE GATEWAY — Raspberry Pi 4")
     print("  Lenh: csv    -> xuat CSV")
@@ -467,6 +524,28 @@ def main():
                         roll, j2, j3, rain, alert,
                         latency_ms, 0)
                 print(f"  [DB] Luu OK")
+
+                # Dự đoán AI hiện tại
+                if AI_ENABLED and ai_model is not None:
+                    ai_label, ai_name, ai_conf = predict_ai_model(
+                        ai_model, tilt, pitch, roll, j2, j3, rain)
+                    if ai_label >= 0:
+                        print(f"  [AI] HIEN TAI : {ai_name} "
+                              f"(conf={ai_conf:.1f}%)")
+                        if ai_label != alert:
+                            print(f"  [AI] ! Khac sensor: "
+                                  f"AI={ai_label} Sensor={alert}")
+
+                # Dự báo sớm 5 phút
+                if AI_ENABLED and ai_model_5p is not None:
+                    ai5_label, ai5_name, ai5_conf = predict_ai_model(
+                        ai_model_5p, tilt, pitch, roll, j2, j3, rain)
+                    if ai5_label >= 0:
+                        print(f"  [AI] DU BAO 5P: {ai5_name} "
+                              f"(conf={ai5_conf:.1f}%)")
+                        if ai5_label > alert:
+                            print(f"  [AI] *** CANH BAO SOM: "
+                                  f"du bao nguy hiem hon hien tai! ***")
 
                 # Gửi email cảnh báo
                 if alert > 0:
