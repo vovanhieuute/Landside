@@ -76,7 +76,14 @@ def load_ai_model():
     except:
         ai_model_5p = None
 
+# Buffer lưu giá trị trước để tính xu hướng
+_prev_buffer = {
+    'tilt': [], 'j2': [], 'j3': [],
+    'rain': [], 'moisture_avg': []
+}
+
 def predict_ai_model(model_dict, tilt, pitch, roll, j2, j3, rain):
+    global _prev_buffer
     if model_dict is None:
         return -1, "CHUA CO MODEL", 0.0
     try:
@@ -85,9 +92,28 @@ def predict_ai_model(model_dict, tilt, pitch, roll, j2, j3, rain):
         moisture_avg  = (j2 + j3) / 2
         moisture_diff = abs(j2 - j3)
         tilt_moisture = tilt_abs * moisture_avg
+
+        # Cập nhật buffer
+        for key, val in [('tilt', tilt), ('j2', j2), ('j3', j3),
+                         ('rain', rain), ('moisture_avg', moisture_avg)]:
+            _prev_buffer[key].append(val)
+            if len(_prev_buffer[key]) > 3:
+                _prev_buffer[key].pop(0)
+
+        buf            = _prev_buffer
+        tilt_diff      = tilt - buf['tilt'][-2]         if len(buf['tilt'])         >= 2 else 0
+        j2_diff        = j2   - buf['j2'][-2]           if len(buf['j2'])           >= 2 else 0
+        j3_diff        = j3   - buf['j3'][-2]           if len(buf['j3'])           >= 2 else 0
+        rain_count     = sum(buf['rain'])
+        tilt_trend     = sum(buf['tilt'])         / len(buf['tilt'])
+        moisture_trend = sum(buf['moisture_avg']) / len(buf['moisture_avg'])
+
         X = np.array([[tilt, pitch, roll, j2, j3, rain,
                        tilt_abs, roll_abs, moisture_avg,
-                       moisture_diff, tilt_moisture]])
+                       moisture_diff, tilt_moisture,
+                       tilt_diff, j2_diff, j3_diff,
+                       rain_count, tilt_trend, moisture_trend]])
+
         xgb   = model_dict['model']
         prob  = xgb.predict_proba(X)[0]
         label = int(np.argmax(prob))

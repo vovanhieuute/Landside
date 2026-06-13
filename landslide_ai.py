@@ -73,15 +73,26 @@ def preprocess(df, forecast_steps=0):
     df = df.copy()
     features = ['tilt', 'pitch', 'roll', 'j2', 'j3', 'rain']
 
+    # Features cơ bản
     df['tilt_abs']      = df['tilt'].abs()
     df['roll_abs']      = df['roll'].abs()
     df['moisture_avg']  = (df['j2'] + df['j3']) / 2
     df['moisture_diff'] = (df['j2'] - df['j3']).abs()
     df['tilt_moisture'] = df['tilt_abs'] * df['moisture_avg']
 
+    # Features xu hướng — cải tiến cho dự báo sớm
+    df['tilt_diff']     = df['tilt'].diff().fillna(0)   # tilt đang tăng/giảm
+    df['j2_diff']       = df['j2'].diff().fillna(0)     # VMC j2 tăng/giảm
+    df['j3_diff']       = df['j3'].diff().fillna(0)     # VMC j3 tăng/giảm
+    df['rain_count']    = df['rain'].rolling(3, min_periods=1).sum()  # mưa liên tiếp
+    df['tilt_trend']    = df['tilt'].rolling(3, min_periods=1).mean() # xu hướng tilt
+    df['moisture_trend']= df['moisture_avg'].rolling(3, min_periods=1).mean()
+
     features_ext = features + [
         'tilt_abs', 'roll_abs',
-        'moisture_avg', 'moisture_diff', 'tilt_moisture'
+        'moisture_avg', 'moisture_diff', 'tilt_moisture',
+        'tilt_diff', 'j2_diff', 'j3_diff',
+        'rain_count', 'tilt_trend', 'moisture_trend'
     ]
     df[features_ext] = df[features_ext].fillna(
         df[features_ext].median())
@@ -167,7 +178,9 @@ def train_xgboost(X_train, X_test, y_train, y_test,
     # Feature Importance
     feat_names = ['tilt','pitch','roll','j2','j3','rain',
                   'tilt_abs','roll_abs','moisture_avg',
-                  'moisture_diff','tilt_moisture']
+                  'moisture_diff','tilt_moisture',
+                  'tilt_diff','j2_diff','j3_diff',
+                  'rain_count','tilt_trend','moisture_trend']
     print("  Feature Importance:")
     for name, imp in sorted(
             zip(feat_names, xgb.feature_importances_),
@@ -285,17 +298,42 @@ def main():
 # ══════════════════════════════════════════════
 # PREDICT REAL-TIME (dùng trong landslide_system.py)
 # ══════════════════════════════════════════════
+# Buffer lưu giá trị trước để tính xu hướng
+_prev_buffer = {
+    'tilt': [], 'j2': [], 'j3': [], 'rain': [], 'moisture_avg': []
+}
+
 def predict_realtime(model_dict, tilt, pitch, roll,
                      j2, j3, rain):
+    global _prev_buffer
+
     tilt_abs      = abs(tilt)
     roll_abs      = abs(roll)
     moisture_avg  = (j2 + j3) / 2
     moisture_diff = abs(j2 - j3)
     tilt_moisture = tilt_abs * moisture_avg
 
+    # Cập nhật buffer (giữ 3 giá trị gần nhất)
+    for key, val in [('tilt', tilt), ('j2', j2), ('j3', j3),
+                     ('rain', rain), ('moisture_avg', moisture_avg)]:
+        _prev_buffer[key].append(val)
+        if len(_prev_buffer[key]) > 3:
+            _prev_buffer[key].pop(0)
+
+    # Tính xu hướng
+    buf = _prev_buffer
+    tilt_diff      = tilt - buf['tilt'][-2] if len(buf['tilt']) >= 2 else 0
+    j2_diff        = j2   - buf['j2'][-2]   if len(buf['j2'])   >= 2 else 0
+    j3_diff        = j3   - buf['j3'][-2]   if len(buf['j3'])   >= 2 else 0
+    rain_count     = sum(buf['rain'])
+    tilt_trend     = sum(buf['tilt']) / len(buf['tilt'])
+    moisture_trend = sum(buf['moisture_avg']) / len(buf['moisture_avg'])
+
     X = np.array([[tilt, pitch, roll, j2, j3, rain,
                    tilt_abs, roll_abs, moisture_avg,
-                   moisture_diff, tilt_moisture]])
+                   moisture_diff, tilt_moisture,
+                   tilt_diff, j2_diff, j3_diff,
+                   rain_count, tilt_trend, moisture_trend]])
 
     xgb   = model_dict['model']
     prob  = xgb.predict_proba(X)[0]
