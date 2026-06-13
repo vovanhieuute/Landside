@@ -1,65 +1,226 @@
 # =============================================
-# landslide_gateway.py
-# Raspberry Pi: Serial → SQLite → Firebase
-# Đo: Latency, PLR, Reliability, E2E, CPU/RAM
+# landslide_system.py
+# Raspberry Pi: Serial → SQLite → Firebase + AI
+# Võ Văn Hiếu - MSSV: 22139021
+# Mô hình AI: XGBoost
+#
+# Chạy: python3 landslide_system.py
+# Lệnh: csv | perf | status | train | exit
 # =============================================
 
-import serial
-import json
-import time
-import pickle
-import numpy as np
-import sqlite3
-import threading
-import psutil
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
+import serial, json, time, pickle, threading
+import numpy as np, sqlite3, psutil, smtplib
+import warnings
+warnings.filterwarnings('ignore')
+
+from email.mime.text       import MIMEText
+from email.mime.multipart  import MIMEMultipart
 import firebase_admin
 from firebase_admin import credentials, db
 
-# ── Cấu hình ─────────────────────────────────
+# ── AI imports ────────────────────────────────
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.preprocessing  import label_binarize
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import (
+    classification_report, confusion_matrix,
+    accuracy_score, f1_score, roc_auc_score,
+    roc_curve, auc
+)
+from imblearn.over_sampling import SMOTE
+from xgboost import XGBClassifier
+
+# CẤU HÌNH
 SERIAL_PORT   = "/dev/ttyUSB0"
 BAUD_RATE     = 115200
 DB_PATH       = "landslide.db"
 FIREBASE_CRED = "serviceAccountKey.json"
 FIREBASE_URL  = "https://landside-cf537-default-rtdb.firebaseio.com"
 CSV_PATH      = "train_data.csv"
+CSV_10K_PATH  = "train_data_10k.csv"
 
-# ── Cấu hình Gmail ───────────────────────────
-EMAIL_SENDER   = "cauuthovohoaichau@gmail.com"    # Gmail gui
-EMAIL_PASSWORD = "sqdr xpsb tvjs flgf"    # App Password Gmail
-EMAIL_RECEIVER = [                            # Danh sach email nhan canh bao
+EMAIL_SENDER   = "cauuthovohoaichau@gmail.com"
+EMAIL_PASSWORD = "sqdr xpsb tvjs flgf"
+EMAIL_RECEIVER = [
     "vovanhieuute@gmail.com",
     "22139021@student.hcmute.edu.vn",
 ]
-EMAIL_ENABLED  = True                     # Tat/bat email
-EMAIL_COOLDOWN = 600                      # Toi thieu 10 phut/email
+EMAIL_ENABLED  = True
+EMAIL_COOLDOWN = 0   # Gửi email ngay lập tức
 
-# ── Cấu hình AI ──────────────────────────────
-AI_MODEL_PATH    = "rf_model.pkl"      # model phan loai hien tai
-AI_MODEL_PATH_5P = "rf_model_5p.pkl"   # model du bao som 5 phut
+AI_MODEL_PATH    = "rf_model.pkl"
+AI_MODEL_PATH_5P = "rf_model_5p.pkl"
 AI_ENABLED       = True
+LABEL_NAMES      = ['AN TOAN', 'CANH BAO', 'NGUY HIEM']
+RANDOM_STATE     = 42
+FORECAST_STEPS   = 1
 
-# ── Load model ────────────────────────────────
+# BIẾN TOÀN CỤC
 ai_model    = None
 ai_model_5p = None
 
+last_email_level = {"N01": -1, "N02": -1, "N03": -1}
+node_last_seen   = {"N01": 0,  "N02": 0,  "N03": 0}
+node_online      = {"N01": False, "N02": False, "N03": False}
+
+perf = {
+    "N01": {"recv":0,"lost":0,"seq_prev":-1,"latencies":[],"e2e":[]},
+    "N02": {"recv":0,"lost":0,"seq_prev":-1,"latencies":[],"e2e":[]},
+    "N03": {"recv":0,"lost":0,"seq_prev":-1,"latencies":[],"e2e":[]},
+}
+
+# AI — TRAIN
+def ai_preprocess(df, forecast_steps=0):
+    df = df.copy()
+    features = ['tilt','pitch','roll','j2','j3','rain']
+    df['tilt_abs']      = df['tilt'].abs()
+    df['roll_abs']      = df['roll'].abs()
+    df['moisture_avg']  = (df['j2'] + df['j3']) / 2
+    df['moisture_diff'] = (df['j2'] - df['j3']).abs()
+    df['tilt_moisture'] = df['tilt_abs'] * df['moisture_avg']
+    feat_ext = features + ['tilt_abs','roll_abs',
+                           'moisture_avg','moisture_diff','tilt_moisture']
+    df[feat_ext] = df[feat_ext].fillna(df[feat_ext].median())
+    if forecast_steps > 0:
+        df['y'] = df['label'].shift(-forecast_steps)
+        df = df.dropna(subset=['y'])
+        df['y'] = df['y'].astype(int)
+    else:
+        df['y'] = df['label']
+    return df[feat_ext].values, df['y'].values, feat_ext
+
+def ai_smote(X_train, y_train):
+    counts = np.bincount(y_train)
+    if counts.min() / counts.max() >= 0.8:
+        return X_train, y_train
+    sm = SMOTE(random_state=RANDOM_STATE)
+    return sm.fit_resample(X_train, y_train)
+
+def ai_train_xgb(X_train, X_test, y_train, y_test, suffix=""):
+    from collections import Counter
+    counts = Counter(y_train)
+    total  = len(y_train)
+    scale  = {c: total/(len(counts)*v) for c,v in counts.items()}
+    xgb = XGBClassifier(
+        n_estimators=200, max_depth=6, learning_rate=0.1,
+        subsample=0.8, colsample_bytree=0.8,
+        use_label_encoder=False, eval_metric='mlogloss',
+        random_state=RANDOM_STATE, n_jobs=-1, verbosity=0)
+    xgb.fit(X_train, y_train,
+            sample_weight=[scale[y] for y in y_train])
+    y_pred = xgb.predict(X_test)
+    y_prob = xgb.predict_proba(X_test)
+    acc = accuracy_score(y_test, y_pred)
+    f1  = f1_score(y_test, y_pred, average='macro')
+    try:
+        auc_s = roc_auc_score(y_test, y_prob,
+                              multi_class='ovr', average='macro')
+    except:
+        auc_s = 0.0
+    print(f"\n  [XGB{suffix}] Accuracy={acc*100:.2f}%  "
+          f"F1={f1*100:.2f}%  AUC={auc_s:.4f}")
+    print(classification_report(y_test, y_pred,
+          target_names=LABEL_NAMES, digits=4))
+
+    # Confusion Matrix
+    cm = confusion_matrix(y_test, y_pred)
+    plt.figure(figsize=(6,5))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+                xticklabels=LABEL_NAMES, yticklabels=LABEL_NAMES)
+    plt.title(f'Confusion Matrix — XGBoost {suffix}')
+    plt.ylabel('Thuc te'); plt.xlabel('Du doan')
+    plt.tight_layout()
+    plt.savefig(f"cm_xgb_{suffix.replace(' ','_')}.png", dpi=150)
+    plt.close()
+
+    # ROC
+    plt.figure(figsize=(7,5))
+    y_bin = label_binarize(y_test, classes=[0,1,2])
+    fpr, tpr, _ = roc_curve(y_bin.ravel(), y_prob.ravel())
+    plt.plot(fpr, tpr, linewidth=2,
+             label=f'XGBoost (AUC={auc(fpr,tpr):.3f})')
+    plt.plot([0,1],[0,1],'k--', label='Random')
+    plt.xlabel('FPR'); plt.ylabel('TPR')
+    plt.title(f'ROC Curve — XGBoost {suffix}')
+    plt.legend(); plt.tight_layout()
+    plt.savefig(f"roc_xgb_{suffix.replace(' ','_')}.png", dpi=150)
+    plt.close()
+    return xgb, acc, f1
+
+def train_ai():
+    global ai_model, ai_model_5p
+    print("\n[AI] Bat dau train...")
+
+    # Đọc CSV 10k nếu có, không thì đọc DB
+    try:
+        df = pd.read_csv(CSV_10K_PATH)
+        print(f"[AI] Doc CSV: {CSV_10K_PATH} ({len(df):,} mau)")
+    except:
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            df = pd.read_sql_query(
+                "SELECT * FROM sensor_data ORDER BY timestamp ASC",
+                conn)
+            conn.close()
+            print(f"[AI] Doc DB: {len(df):,} mau")
+        except Exception as e:
+            print(f"[AI] Loi doc data: {e}")
+            return
+
+    if 'label' not in df.columns:
+        df['label'] = df['alert']
+
+    print(f"[AI] Phan phoi: "
+          + " | ".join([f"L{i}={( df['label']==i).sum()}"
+                        for i in range(3)]))
+
+    # Phần A: hiện tại
+    X, y, feat = ai_preprocess(df, 0)
+    Xtr, Xte, ytr, yte = train_test_split(
+        X, y, test_size=0.2, random_state=RANDOM_STATE, stratify=y)
+    Xtr_sm, ytr_sm = ai_smote(Xtr, ytr)
+    xgb, acc, f1 = ai_train_xgb(Xtr_sm, Xte, ytr_sm, yte, "Hien_tai")
+    model_dict = {'model': xgb, 'scaler': None,
+                  'type': 'xgb', 'features': feat}
+    with open(AI_MODEL_PATH, 'wb') as f_:
+        pickle.dump(model_dict, f_)
+    ai_model = model_dict
+    print(f"[AI] Luu: {AI_MODEL_PATH}")
+
+    # Phần B: dự báo 5p
+    X_f, y_f, _ = ai_preprocess(df, FORECAST_STEPS)
+    Xtr_f, Xte_f, ytr_f, yte_f = train_test_split(
+        X_f, y_f, test_size=0.2, random_state=RANDOM_STATE, stratify=y_f)
+    Xtr_f_sm, ytr_f_sm = ai_smote(Xtr_f, ytr_f)
+    xgb_f, acc_f, f1_f = ai_train_xgb(
+        Xtr_f_sm, Xte_f, ytr_f_sm, yte_f, "Du_bao_5p")
+    model_dict_5p = {'model': xgb_f, 'scaler': None,
+                     'type': 'xgb', 'features': feat}
+    with open(AI_MODEL_PATH_5P, 'wb') as f_:
+        pickle.dump(model_dict_5p, f_)
+    ai_model_5p = model_dict_5p
+    print(f"[AI] Luu: {AI_MODEL_PATH_5P}")
+    print(f"[AI] Train xong! Hien tai: Acc={acc*100:.1f}% F1={f1*100:.1f}%"
+          f" | 5p: Acc={acc_f*100:.1f}% F1={f1_f*100:.1f}%\n")
+
+
+# AI — LOAD & PREDICT
 def load_ai_model():
     global ai_model, ai_model_5p
     try:
         with open(AI_MODEL_PATH, 'rb') as f:
             ai_model = pickle.load(f)
         print(f"[AI] Load model OK: {AI_MODEL_PATH}")
-    except Exception as e:
-        print(f"[AI] Loi load model: {e}")
+    except:
+        print(f"[AI] Chua co model — goi lenh 'train' de tao")
         ai_model = None
     try:
         with open(AI_MODEL_PATH_5P, 'rb') as f:
             ai_model_5p = pickle.load(f)
         print(f"[AI] Load model 5p OK: {AI_MODEL_PATH_5P}")
-    except Exception as e:
-        print(f"[AI] Khong co model 5p: {e}")
+    except:
         ai_model_5p = None
 
 def predict_ai_model(model_dict, tilt, pitch, roll, j2, j3, rain):
@@ -74,57 +235,22 @@ def predict_ai_model(model_dict, tilt, pitch, roll, j2, j3, rain):
         X = np.array([[tilt, pitch, roll, j2, j3, rain,
                        tilt_abs, roll_abs, moisture_avg,
                        moisture_diff, tilt_moisture]])
-        rf, svm, xgb = model_dict['model']
-        scaler = model_dict['scaler']
-        X_s = scaler.transform(X)
-        prob = (rf.predict_proba(X)[0] +
-                svm.predict_proba(X_s)[0] +
-                xgb.predict_proba(X)[0]) / 3
+        xgb   = model_dict['model']
+        prob  = xgb.predict_proba(X)[0]
         label = int(np.argmax(prob))
         conf  = float(prob[label]) * 100
-        names = ['AN TOAN', 'CANH BAO', 'NGUY HIEM']
-        return label, names[label], round(conf, 1)
+        return label, LABEL_NAMES[label], round(conf, 1)
     except Exception as e:
         print(f"[AI] Loi predict: {e}")
         return -1, "LOI", 0.0
 
-
-
-# ── Theo dõi email ────────────────────────────
-last_email_level = {"N01": -1, "N02": -1, "N03": -1}
-
-# ── Theo dõi node ─────────────────────────────
-node_last_seen = {"N01": 0, "N02": 0, "N03": 0}
-node_online    = {"N01": False, "N02": False, "N03": False}
-
-# ── Đo hiệu năng ─────────────────────────────
-perf = {
-    "N01": {"recv": 0, "lost": 0,
-            "seq_prev": -1,
-            "latencies": [], "e2e": []},
-    "N02": {"recv": 0, "lost": 0,
-            "seq_prev": -1,
-            "latencies": [], "e2e": []},
-    "N03": {"recv": 0, "lost": 0,
-            "seq_prev": -1,
-            "latencies": [], "e2e": []},
-}
-
-
-# ── Gửi email cảnh báo ───────────────────────
+# EMAIL
 def send_alert_email(node_id, alert, pitch, tilt, j2, j3, rain):
-    if not EMAIL_ENABLED:
-        return
-    if alert == 0:
-        last_email_level[node_id] = -1
-        return
-    if alert <= last_email_level.get(node_id, -1):
-        return
-
-    levels = {1: "CANH BAO", 2: "NGUY HIEM"}
-    emoji  = {1: "⚠️", 2: "🚨"}
-    colors = {1: "#FF8C00", 2: "#FF0000"}
-
+    if not EMAIL_ENABLED: return
+    if alert == 0: return
+    levels = {1:"CANH BAO", 2:"NGUY HIEM"}
+    emoji  = {1:"⚠️", 2:"🚨"}
+    colors = {1:"#FF8C00", 2:"#FF0000"}
     subject = f"{emoji.get(alert,'⚠️')} [{levels.get(alert,'?')}] Sat lo dat - {node_id}"
     body = f"""
 <html><body style="font-family:Arial;background:#f5f5f5;padding:20px">
@@ -151,12 +277,11 @@ def send_alert_email(node_id, alert, pitch, tilt, j2, j3, rain):
       <td style="padding:8px;color:#666">Thoi gian</td>
       <td style="padding:8px">{time.strftime("%d/%m/%Y %H:%M:%S")}</td></tr>
 </table>
-{('<p style="color:red;font-weight:bold">⚠ NGUY HIEM — Kiem tra khu vuc ngay!</p>' if alert == 2 else '<p style="color:#FF8C00">Theo doi chat tinh trang mai doc.</p>')}
+{('<p style="color:red;font-weight:bold">⚠ NGUY HIEM — Kiem tra khu vuc ngay!</p>' if alert==2 else '<p style="color:#FF8C00">Theo doi chat tinh trang mai doc.</p>')}
 <p style="color:#999;font-size:12px;margin-top:16px">
   He thong canh bao sat lo dat — HCMUTE — Vo Van Hieu 22139021
 </p>
-</div></body></html>
-"""
+</div></body></html>"""
     try:
         msg = MIMEMultipart("alternative")
         msg["Subject"] = subject
@@ -166,39 +291,90 @@ def send_alert_email(node_id, alert, pitch, tilt, j2, j3, rain):
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
             smtp.login(EMAIL_SENDER, EMAIL_PASSWORD)
             smtp.sendmail(EMAIL_SENDER, EMAIL_RECEIVER, msg.as_string())
-        last_email_level[node_id] = alert
-        print(f"  [EMAIL] Gui OK -> {', '.join(EMAIL_RECEIVER)} (muc {alert})")
+        print(f"  [EMAIL] Gui OK (muc {alert})")
     except Exception as e:
         print(f"  [EMAIL] Loi: {e}")
 
-# ── SQLite ────────────────────────────────────
+def send_alert_email_early(node_id, ai_label, ai_name,
+                            ai_conf, pitch, tilt, j2, j3, rain):
+    """Gửi email cảnh báo sớm khi AI dự báo nguy hiểm hơn sensor"""
+    if not EMAIL_ENABLED: return
+    colors = {1:"#FF8C00", 2:"#FF0000"}
+    color  = colors.get(ai_label, "#FF8C00")
+    subject = f"🔮 [CANH BAO SOM] AI du bao {ai_name} trong 5 phut - {node_id}"
+    body = f"""
+<html><body style="font-family:Arial;background:#f5f5f5;padding:20px">
+<div style="background:#fff;border-radius:8px;padding:24px;max-width:500px;
+     margin:auto;border-left:6px solid {color}">
+<h2 style="color:{color};margin-top:0">
+  🔮 CANH BAO SOM — AI DU BAO
+</h2>
+<p style="color:#666">AI du bao tinh trang
+  <b style="color:{color}">{ai_name}</b>
+  trong vong <b>5 phut toi</b>
+  (do tin cay: {ai_conf:.1f}%)
+</p>
+<table style="width:100%;border-collapse:collapse">
+  <tr><td style="padding:8px;color:#666">Node</td>
+      <td style="padding:8px;font-weight:bold">{node_id}</td></tr>
+  <tr style="background:#f9f9f9">
+      <td style="padding:8px;color:#666">AI du bao</td>
+      <td style="padding:8px;font-weight:bold;color:{color}">
+        {ai_name} ({ai_conf:.1f}%)</td></tr>
+  <tr><td style="padding:8px;color:#666">Goc nghieng hien tai</td>
+      <td style="padding:8px">Pitch={pitch:.1f}°  Tilt={tilt:.1f}°</td></tr>
+  <tr style="background:#f9f9f9">
+      <td style="padding:8px;color:#666">Do am dat</td>
+      <td style="padding:8px">J2={j2:.0f}%  J3={j3:.0f}%</td></tr>
+  <tr><td style="padding:8px;color:#666">Mua</td>
+      <td style="padding:8px">{"CO MUA" if rain else "KHONG MUA"}</td></tr>
+  <tr style="background:#f9f9f9">
+      <td style="padding:8px;color:#666">Thoi gian</td>
+      <td style="padding:8px">{time.strftime("%d/%m/%Y %H:%M:%S")}</td></tr>
+</table>
+<p style="color:{color};font-weight:bold;margin-top:16px">
+  ⚠ Hay kiem tra khu vuc mai doc ngay!
+</p>
+<p style="color:#999;font-size:12px">
+  He thong canh bao sat lo dat — HCMUTE — Vo Van Hieu 22139021
+</p>
+</div></body></html>"""
+    try:
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = subject
+        msg["From"]    = EMAIL_SENDER
+        msg["To"]      = ", ".join(EMAIL_RECEIVER)
+        msg.attach(MIMEText(body, "html", "utf-8"))
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
+            smtp.login(EMAIL_SENDER, EMAIL_PASSWORD)
+            smtp.sendmail(EMAIL_SENDER, EMAIL_RECEIVER, msg.as_string())
+        print(f"  [EMAIL-SOM] Gui OK -> {ai_name} (conf={ai_conf:.1f}%)")
+    except Exception as e:
+        print(f"  [EMAIL-SOM] Loi: {e}")
+
+# SQLITE
 def init_db():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.execute('''
         CREATE TABLE IF NOT EXISTS sensor_data (
-            id        INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp TEXT    NOT NULL,
-            node_id   TEXT    NOT NULL,
-            seq       INTEGER DEFAULT -1,
-            pitch     REAL    DEFAULT 0,
-            tilt      REAL    DEFAULT 0,
-            roll      REAL    DEFAULT 0,
-            j2        REAL    DEFAULT 0,
-            j3        REAL    DEFAULT 0,
-            rain      INTEGER DEFAULT 0,
-            alert     INTEGER DEFAULT 0,
-            label     INTEGER DEFAULT -1,
-            latency_ms REAL   DEFAULT 0,
-            e2e_ms    REAL    DEFAULT 0
-        )
-    ''')
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp  TEXT    NOT NULL,
+            node_id    TEXT    NOT NULL,
+            seq        INTEGER DEFAULT -1,
+            pitch      REAL    DEFAULT 0,
+            tilt       REAL    DEFAULT 0,
+            roll       REAL    DEFAULT 0,
+            j2         REAL    DEFAULT 0,
+            j3         REAL    DEFAULT 0,
+            rain       INTEGER DEFAULT 0,
+            alert      INTEGER DEFAULT 0,
+            label      INTEGER DEFAULT -1,
+            latency_ms REAL    DEFAULT 0,
+            e2e_ms     REAL    DEFAULT 0
+        )''')
     conn.commit()
-
-    existing = {
-        row[1]
-        for row in conn.execute("PRAGMA table_info(sensor_data)")
-    }
-    migrations = {
+    existing = {r[1] for r in conn.execute("PRAGMA table_info(sensor_data)")}
+    for col, sql in {
         "pitch"     : "ALTER TABLE sensor_data ADD COLUMN pitch      REAL    DEFAULT 0",
         "tilt"      : "ALTER TABLE sensor_data ADD COLUMN tilt       REAL    DEFAULT 0",
         "roll"      : "ALTER TABLE sensor_data ADD COLUMN roll       REAL    DEFAULT 0",
@@ -206,25 +382,18 @@ def init_db():
         "seq"       : "ALTER TABLE sensor_data ADD COLUMN seq        INTEGER DEFAULT -1",
         "latency_ms": "ALTER TABLE sensor_data ADD COLUMN latency_ms REAL    DEFAULT 0",
         "e2e_ms"    : "ALTER TABLE sensor_data ADD COLUMN e2e_ms     REAL    DEFAULT 0",
-    }
-    for col, sql in migrations.items():
+    }.items():
         if col not in existing:
-            conn.execute(sql)
-            conn.commit()
-            print(f"[DB] Da them cot: {col}")
-
+            conn.execute(sql); conn.commit()
     print("[DB] SQLite OK!")
     return conn
 
-# ── Lưu DB ───────────────────────────────────
 def save_db(conn, node_id, seq, pitch, tilt, roll,
             j2, j3, rain, alert, latency_ms, e2e_ms):
     try:
-        p = abs(pitch)
-        if   p < 0.5:  label = 0
-        elif p < 1.5:  label = 1
-        else:          label = 2
-
+        if tilt > 3.0 or j2 > 75 or j3 > 75:   label = 2
+        elif tilt > 1.5 or j2 > 65 or j3 > 65: label = 1
+        else:                                    label = 0
         conn.execute(
             "INSERT INTO sensor_data "
             "(timestamp,node_id,seq,pitch,tilt,roll,"
@@ -233,90 +402,57 @@ def save_db(conn, node_id, seq, pitch, tilt, roll,
             (time.strftime('%Y-%m-%d %H:%M:%S'),
              node_id, seq, pitch, tilt, roll,
              j2, j3, rain, alert, label,
-             latency_ms, e2e_ms)
-        )
+             latency_ms, e2e_ms))
         conn.commit()
     except Exception as e:
-        print(f"  [DB] Loi luu: {e}")
+        print(f"  [DB] Loi: {e}")
 
-# ── Xuất CSV ─────────────────────────────────
 def export_csv(conn):
     try:
-        import pandas as pd
         df = pd.read_sql_query(
-            "SELECT timestamp, node_id, seq, "
-            "pitch, roll, tilt, j2, j3, rain, "
-            "alert, label, latency_ms, e2e_ms "
-            "FROM sensor_data ORDER BY timestamp ASC",
-            conn
-        )
+            "SELECT timestamp,node_id,seq,pitch,roll,tilt,"
+            "j2,j3,rain,alert,label,latency_ms,e2e_ms "
+            "FROM sensor_data ORDER BY timestamp ASC", conn)
         df.to_csv(CSV_PATH, index=False)
-        total = len(df)
-        c0 = len(df[df['label'] == 0])
-        c1 = len(df[df['label'] == 1])
-        c2 = len(df[df['label'] == 2])
-        print(f"\n[CSV] Xuat: {CSV_PATH}")
-        print(f"  Tong    : {total} mau")
-        print(f"  Label 0 : {c0}")
-        print(f"  Label 1 : {c1}")
-        print(f"  Label 2 : {c2}\n")
-    except ImportError:
-        print("[CSV] pip3 install pandas")
+        print(f"[CSV] Xuat {len(df)} mau -> {CSV_PATH}")
+        for i,n in enumerate(LABEL_NAMES):
+            print(f"  L{i} {n}: {(df['label']==i).sum()}")
+        print()
     except Exception as e:
         print(f"[CSV] Loi: {e}")
 
-# ── In báo cáo hiệu năng ─────────────────────
-def print_perf_report():
-    print("\n" + "=" * 55)
-    print("  BAO CAO HIEU NANG HE THONG")
-    print("=" * 55)
+# HIỆU NĂNG
 
+def print_perf_report():
+    print("\n" + "="*55)
+    print("  BAO CAO HIEU NANG")
+    print("="*55)
     for nid, p in perf.items():
         recv = p["recv"]
+        if recv == 0: continue
         lost = p["lost"]
-        if recv == 0:
-            continue
-
         sent = recv + lost
-        plr  = (lost / sent * 100) if sent > 0 else 0.0
-        rel  = (recv / sent * 100) if sent > 0 else 0.0
-
-        lats = p["latencies"]
-        avg_lat = sum(lats) / len(lats) if lats else 0
-        max_lat = max(lats)             if lats else 0
-
-        e2es = p["e2e"]
-        avg_e2e = sum(e2es) / len(e2es) if e2es else 0
-        max_e2e = max(e2es)             if e2es else 0
-
         print(f"\n  [{nid}]")
-        print(f"  Goi nhan           : {recv}")
-        print(f"  Goi mat (uoc tinh) : {lost}")
-        print(f"  Tong (uoc tinh)    : {sent}")
-        print(f"  PLR                : {plr:.2f}%")
-        print(f"  Reliability        : {rel:.2f}%")
+        print(f"  PLR         : {lost/sent*100:.2f}%")
+        print(f"  Reliability : {recv/sent*100:.2f}%")
+        lats = p["latencies"]
         if lats:
-            print(f"  Latency trung binh : {avg_lat:.1f} ms")
-            print(f"  Latency max        : {max_lat:.1f} ms")
+            print(f"  Latency TB  : {sum(lats)/len(lats):.1f}ms")
+        e2es = p["e2e"]
         if e2es:
-            print(f"  E2E trung binh     : {avg_e2e:.1f} ms")
-            print(f"  E2E max            : {max_e2e:.1f} ms")
-
+            print(f"  E2E TB      : {sum(e2es)/len(e2es):.1f}ms")
     cpu = psutil.cpu_percent(interval=1)
     ram = psutil.virtual_memory()
-    print(f"\n  CPU Usage : {cpu:.1f}%")
-    print(f"  RAM Usage : {ram.used//1024//1024} MB / "
-          f"{ram.total//1024//1024} MB "
-          f"({ram.percent:.1f}%)")
-    print("=" * 55 + "\n")
+    print(f"\n  CPU: {cpu:.1f}%  "
+          f"RAM: {ram.used//1024//1024}/"
+          f"{ram.total//1024//1024}MB ({ram.percent:.1f}%)")
+    print("="*55+"\n")
 
-# ── Firebase ─────────────────────────────────
+# FIREBASE
 def init_firebase():
     try:
         cred = credentials.Certificate(FIREBASE_CRED)
-        firebase_admin.initialize_app(cred, {
-            'databaseURL': FIREBASE_URL
-        })
+        firebase_admin.initialize_app(cred, {'databaseURL': FIREBASE_URL})
         print("[Firebase] Ket noi OK!")
         return True
     except Exception as e:
@@ -324,10 +460,11 @@ def init_firebase():
         return False
 
 def push_firebase(node_id, pitch, tilt, roll,
-                  j2, j3, rain, alert):
+                  j2, j3, rain, alert,
+                  ai_label=-1, ai_name="", ai_conf=0.0,
+                  ai5_label=-1, ai5_name="", ai5_conf=0.0):
     try:
-        t_before = time.time()
-        db.reference(f'landslide/nodes/{node_id}').set({
+        node_data = {
             'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
             'pitch'    : round(pitch, 1),
             'tilt'     : round(tilt,  1),
@@ -337,48 +474,55 @@ def push_firebase(node_id, pitch, tilt, roll,
             'rain'     : rain,
             'alert'    : alert,
             'status'   : 'online',
-        })
+        }
+        if ai_label >= 0:
+            node_data['ai'] = {
+                'label': ai_label,
+                'name' : ai_name,
+                'conf' : round(ai_conf, 1)
+            }
+        if ai5_label >= 0:
+            node_data['ai5p'] = {
+                'label': ai5_label,
+                'name' : ai5_name,
+                'conf' : round(ai5_conf, 1)
+            }
+        db.reference(f'landslide/nodes/{node_id}').set(node_data)
         db.reference('landslide/global').update({
             'lastUpdate' : time.strftime('%Y-%m-%d %H:%M:%S'),
-            'globalAlert': alert
+            'globalAlert': alert,
+            'aiAlert'    : ai_label if ai_label >= 0 else alert,
+            'ai5pAlert'  : ai5_label if ai5_label >= 0 else -1,
         })
-        rt = (time.time() - t_before) * 1000
-        print(f"  [Firebase] Push OK -> {node_id} "
-              f"alert={alert} RT={rt:.0f}ms")
+        print(f"  [Firebase] {node_id} OK "
+              f"alert={alert} AI={ai_name}({ai_conf:.0f}%)")
     except Exception as e:
-        print(f"  [Firebase] Loi push: {e}")
+        print(f"  [Firebase] Loi: {e}")
 
 def set_node_offline_firebase(nid):
     try:
         db.reference(f'landslide/nodes/{nid}').update({
-            'status'     : 'offline',
-            'timestamp'  : time.strftime('%Y-%m-%d %H:%M:%S'),
-            'pitch'      : 0, 'tilt': 0, 'roll': 0,
-            'j2'         : 0, 'j3' : 0, 'rain': 0,
-            'alert'      : 0
+            'status':'offline',
+            'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+            'pitch':0,'tilt':0,'roll':0,'j2':0,'j3':0,'rain':0,'alert':0
         })
-        print(f"  [Firebase] {nid} -> offline")
-    except Exception as e:
-        print(f"  [Firebase] Loi set offline: {e}")
+    except: pass
 
-# ── Thread kiểm tra timeout node ─────────────
+# THREADS
 def check_node_timeout(fb_ok):
     while True:
         now = time.time()
-        for nid in ["N01", "N02", "N03"]:
+        for nid in ["N01","N02","N03"]:
             last = node_last_seen[nid]
-            if last > 0 and now - last > 300:
-                if node_online[nid]:
-                    node_online[nid] = False
-                    print(f"[TIMEOUT] {nid} mat ket noi!\n")
-                    if fb_ok:
-                        threading.Thread(
-                            target=set_node_offline_firebase,
-                            args=(nid,), daemon=True
-                        ).start()
+            if last > 0 and now - last > 300 and node_online[nid]:
+                node_online[nid] = False
+                print(f"[TIMEOUT] {nid} mat ket noi!\n")
+                if fb_ok:
+                    threading.Thread(
+                        target=set_node_offline_firebase,
+                        args=(nid,), daemon=True).start()
         time.sleep(5)
 
-# ── Thread log CPU/RAM mỗi 60 giây ───────────
 def resource_monitor():
     last = time.time()
     while True:
@@ -386,22 +530,22 @@ def resource_monitor():
             cpu = psutil.cpu_percent(interval=1)
             ram = psutil.virtual_memory()
             print(f"[RES] CPU={cpu:.1f}%  "
-                  f"RAM={ram.used//1024//1024}MB/"
-                  f"{ram.total//1024//1024}MB "
+                  f"RAM={ram.used//1024//1024}MB "
                   f"({ram.percent:.1f}%)")
             last = time.time()
         time.sleep(5)
 
-# ── Main ─────────────────────────────────────
+# MAIN
 def main():
     load_ai_model()
-    print("=" * 55)
+    print("="*55)
     print("  LANDSLIDE GATEWAY — Raspberry Pi 4")
-    print("  Lenh: csv    -> xuat CSV")
-    print("  Lenh: perf   -> bao cao hieu nang")
-    print("  Lenh: status -> so ban ghi DB")
-    print("  Lenh: exit   -> thoat")
-    print("=" * 55 + "\n")
+    print("  csv   -> xuat CSV")
+    print("  perf  -> hieu nang")
+    print("  train -> train AI tu data DB/CSV")
+    print("  status-> so ban ghi DB")
+    print("  exit  -> thoat")
+    print("="*55+"\n")
 
     conn  = init_db()
     fb_ok = init_firebase()
@@ -416,12 +560,10 @@ def main():
     time.sleep(2)
     print("[OK] San sang!\n")
 
-    threading.Thread(
-        target=check_node_timeout,
-        args=(fb_ok,), daemon=True).start()
-    threading.Thread(
-        target=resource_monitor,
-        daemon=True).start()
+    threading.Thread(target=check_node_timeout,
+                     args=(fb_ok,), daemon=True).start()
+    threading.Thread(target=resource_monitor,
+                     daemon=True).start()
 
     def keyboard_thread():
         while True:
@@ -431,12 +573,15 @@ def main():
                     export_csv(conn)
                 elif cmd == "perf":
                     print_perf_report()
+                elif cmd == "train":
+                    threading.Thread(
+                        target=train_ai, daemon=True).start()
                 elif cmd == "status":
                     rows = conn.execute(
                         "SELECT COUNT(*) FROM sensor_data"
                     ).fetchone()
                     print(f"[DB] Tong: {rows[0]} ban ghi\n")
-                elif cmd in ("exit", "quit"):
+                elif cmd in ("exit","quit"):
                     print("[*] Thoat...")
                     export_csv(conn)
                     print_perf_report()
@@ -444,8 +589,8 @@ def main():
             except:
                 break
 
-    threading.Thread(
-        target=keyboard_thread, daemon=True).start()
+    threading.Thread(target=keyboard_thread,
+                     daemon=True).start()
 
     last_auto_csv = time.time()
 
@@ -461,32 +606,27 @@ def main():
                 continue
 
             data     = json.loads(line)
-            msg_type = data.get("type", "")
+            msg_type = data.get("type","")
 
             if msg_type == "data":
-                t_recv   = time.time()
-                node_id  = data.get("node",  "")
-                seq      = int(data.get("seq",   -1))
-                ts_gw    = int(data.get("ts",     0))
-                pitch    = float(data.get("pitch", 0))
-                tilt     = float(data.get("tilt",  0))
-                roll     = float(data.get("roll",  0))
-                j2       = float(data.get("j2",    0))
-                j3       = float(data.get("j3",    0))
-                rain     = int(data.get("rain",    0))
-                alert    = int(data.get("alert",   0))
+                t_recv  = time.time()
+                node_id = data.get("node","")
+                seq     = int(data.get("seq",  -1))
+                pitch   = float(data.get("pitch", 0))
+                tilt    = float(data.get("tilt",  0))
+                roll    = float(data.get("roll",  0))
+                j2      = float(data.get("j2",    0))
+                j3      = float(data.get("j3",    0))
+                rain    = int(data.get("rain",    0))
+                alert   = int(data.get("alert",   0))
 
-                if not node_id:
-                    continue
+                if not node_id: continue
 
                 tilt = abs(tilt)
                 node_last_seen[node_id] = t_recv
                 node_online[node_id]    = True
 
-                latency_ms = (time.time() - t_recv) * 1000
-                if latency_ms < 0:
-                    latency_ms = 0
-
+                latency_ms  = max((time.time()-t_recv)*1000, 0)
                 t_e2e_start = time.time()
 
                 p = perf[node_id]
@@ -495,37 +635,28 @@ def main():
                     prev = p["seq_prev"]
                     if prev >= 0:
                         if seq < prev:
-                            print(f"  [PLR] {node_id} seq reset "
-                                  f"({prev}→{seq})")
+                            print(f"  [PLR] {node_id} seq reset")
                         elif seq > prev + 1:
                             lost = seq - prev - 1
                             p["lost"] += lost
-                            print(f"  [PLR] {node_id} mat "
-                                  f"{lost} goi "
-                                  f"(seq {prev+1}→{seq-1})")
+                            print(f"  [PLR] {node_id} mat {lost} goi")
                     p["seq_prev"] = seq
-
                 if latency_ms > 0:
                     p["latencies"].append(latency_ms)
 
-                levels = {0:"AN TOAN", 1:"CANH BAO",
-                          2:"NGUY HIEM!"}
-                print(f"[{node_id}] {time.strftime('%H:%M:%S')} "
-                      f"seq={seq}")
-                print(f"  Pitch={pitch:.1f} Tilt={tilt:.1f} "
-                      f"Roll={roll:.1f} "
+                levels = {0:"AN TOAN",1:"CANH BAO",2:"NGUY HIEM!"}
+                print(f"[{node_id}] {time.strftime('%H:%M:%S')} seq={seq}")
+                print(f"  Pitch={pitch:.1f} Tilt={tilt:.1f} Roll={roll:.1f} "
                       f"J2={j2:.0f}% J3={j3:.0f}% "
                       f"Mua={'Co' if rain else 'Khong'}")
-                if latency_ms > 0:
-                    print(f"  Latency={latency_ms:.0f}ms")
-                print(f"  >>> {levels.get(alert, '?')}")
+                print(f"  >>> {levels.get(alert,'?')}")
 
                 save_db(conn, node_id, seq, pitch, tilt,
-                        roll, j2, j3, rain, alert,
-                        latency_ms, 0)
+                        roll, j2, j3, rain, alert, latency_ms, 0)
                 print(f"  [DB] Luu OK")
 
-                # Dự đoán AI hiện tại
+                # AI dự đoán hiện tại
+                ai_label, ai_name, ai_conf = -1, "", 0.0
                 if AI_ENABLED and ai_model is not None:
                     ai_label, ai_name, ai_conf = predict_ai_model(
                         ai_model, tilt, pitch, roll, j2, j3, rain)
@@ -536,7 +667,8 @@ def main():
                             print(f"  [AI] ! Khac sensor: "
                                   f"AI={ai_label} Sensor={alert}")
 
-                # Dự báo sớm 5 phút
+                # AI dự báo 5p
+                ai5_label, ai5_name, ai5_conf = -1, "", 0.0
                 if AI_ENABLED and ai_model_5p is not None:
                     ai5_label, ai5_name, ai5_conf = predict_ai_model(
                         ai_model_5p, tilt, pitch, roll, j2, j3, rain)
@@ -544,25 +676,32 @@ def main():
                         print(f"  [AI] DU BAO 5P: {ai5_name} "
                               f"(conf={ai5_conf:.1f}%)")
                         if ai5_label > alert:
-                            print(f"  [AI] *** CANH BAO SOM: "
-                                  f"du bao nguy hiem hon hien tai! ***")
+                            print(f"  [AI] *** CANH BAO SOM! ***")
+                            # Gửi email cảnh báo sớm
+                            threading.Thread(
+                                target=send_alert_email_early,
+                                args=(node_id, ai5_label, ai5_name,
+                                      ai5_conf, pitch, tilt,
+                                      j2, j3, rain),
+                                daemon=True).start()
 
-                # Gửi email cảnh báo
+                # Email cảnh báo sensor
                 if alert > 0:
                     threading.Thread(
                         target=send_alert_email,
                         args=(node_id, alert, pitch,
                               tilt, j2, j3, rain),
-                        daemon=True
-                    ).start()
+                        daemon=True).start()
 
+                # Firebase
                 if fb_ok:
-                    def push_and_measure(nid, p_, t_, r_,
-                                         j2_, j3_, ra_, al_,
-                                         t_start_):
-                        push_firebase(nid, p_, t_, r_,
-                                      j2_, j3_, ra_, al_)
-                        e2e = (time.time() - t_start_) * 1000
+                    def push_and_measure(
+                            nid, p_, t_, r_, j2_, j3_, ra_, al_,
+                            ail_, ain_, aic_,
+                            ai5l_, ai5n_, ai5c_, t_start_):
+                        push_firebase(nid, p_, t_, r_, j2_, j3_, ra_, al_,
+                                      ail_, ain_, aic_, ai5l_, ai5n_, ai5c_)
+                        e2e = (time.time()-t_start_)*1000
                         perf[nid]["e2e"].append(e2e)
                         print(f"  [E2E] {nid}: {e2e:.0f}ms")
 
@@ -570,41 +709,30 @@ def main():
                         target=push_and_measure,
                         args=(node_id, pitch, tilt, roll,
                               j2, j3, rain, alert,
+                              ai_label, ai_name, ai_conf,
+                              ai5_label, ai5_name, ai5_conf,
                               t_e2e_start),
-                        daemon=True
-                    ).start()
-
+                        daemon=True).start()
                 print()
-
-            elif msg_type == "heartbeat":
-                count = data.get("count", 0)
-                print(f"[HB] Gateway OK | {count} ban tin\n")
-                if fb_ok:
-                    try:
-                        db.reference('landslide/gateway').set({
-                            'status'   : 'online',
-                            'lastHB'   : time.strftime('%H:%M:%S'),
-                            'msgCount' : count
-                        })
-                    except:
-                        pass
-
-            elif msg_type == "timeout":
-                nid = data.get("node", "?")
-                print(f"[!] {nid} MAT KET NOI!\n")
-                if fb_ok:
-                    threading.Thread(
-                        target=set_node_offline_firebase,
-                        args=(nid,), daemon=True
-                    ).start()
 
             elif msg_type == "status":
                 n1 = "ON" if data.get("n1") else "OFF"
                 n2 = "ON" if data.get("n2") else "OFF"
                 n3 = "ON" if data.get("n3") else "OFF"
                 ga = data.get("globalAlert", 0)
-                print(f"[STATUS] N1={n1} N2={n2} "
-                      f"N3={n3} Alert={ga}\n")
+                print(f"[STATUS] N1={n1} N2={n2} N3={n3} Alert={ga}\n")
+
+            elif msg_type == "timeout":
+                nid = data.get("node","?")
+                print(f"[!] {nid} MAT KET NOI!\n")
+                if fb_ok:
+                    threading.Thread(
+                        target=set_node_offline_firebase,
+                        args=(nid,), daemon=True).start()
+
+            elif msg_type == "heartbeat":
+                count = data.get("count", 0)
+                print(f"[HB] Gateway OK | {count} ban tin\n")
 
         except json.JSONDecodeError:
             pass
@@ -612,8 +740,7 @@ def main():
             print("\n[*] Thoat...")
             export_csv(conn)
             print_perf_report()
-            ser.close()
-            conn.close()
+            ser.close(); conn.close()
             break
         except Exception as e:
             print(f"[ERR] {e}")
