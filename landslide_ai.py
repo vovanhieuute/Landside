@@ -66,7 +66,7 @@ def load_data():
 # ══════════════════════════════════════════════
 def preprocess(df, forecast_steps=0):
     print("\n" + "="*55)
-    title = f"DU BAO SOM {forecast_steps*5} PHUT" if forecast_steps > 0 else "HIEN TAI"
+    title = f"DU BAO SOM {forecast_steps} BUOC (~{forecast_steps*9.5/60:.1f} PHUT)" if forecast_steps > 0 else "HIEN TAI"
     print(f"  BUOC 2: TIEN XU LY ({title})")
     print("="*55)
 
@@ -101,7 +101,7 @@ def preprocess(df, forecast_steps=0):
         df['y'] = df['label'].shift(-forecast_steps)
         df = df.dropna(subset=['y'])
         df['y'] = df['y'].astype(int)
-        print(f"  Label dich truoc {forecast_steps} buoc (~{forecast_steps*5} phut)")
+        print(f"  Label dich truoc {forecast_steps} buoc (~{forecast_steps*9.5/60:.1f} phut)")
     else:
         df['y'] = df['label']
 
