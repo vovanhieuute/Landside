@@ -30,12 +30,12 @@ from xgboost import XGBClassifier
 # ══════════════════════════════════════════════
 # CẤU HÌNH
 # ══════════════════════════════════════════════
-CSV_PATH       = "train_data_10k.csv"
+CSV_PATH       = "train_data_24k.csv"
 LABEL_NAMES    = ['AN TOAN', 'CANH BAO', 'NGUY HIEM']
 RANDOM_STATE   = 42
 MODEL_SAVE     = "rf_model.pkl"
 MODEL_SAVE_5P  = "rf_model_5p.pkl"
-FORECAST_STEPS = 1   # 1 buoc ~ 5 phut
+FORECAST_STEPS = 33  # 33 bước × ~9.5s ≈ 313s ≈ 5 phút thực sự
 
 # ══════════════════════════════════════════════
 # 1. ĐỌC DỮ LIỆU TỪ CSV
@@ -262,8 +262,8 @@ def main():
     print(f"\n  [MODEL] Da luu: {MODEL_SAVE}")
 
     # ── PHẦN B: Dự báo sớm 5 phút ─────────────
-    print("\n\n" + "▓"*55)
-    print(f"  PHAN B: DU BAO SOM {FORECAST_STEPS*5} PHUT TRUOC")
+    print(f"\n\n" + "▓"*55)
+    print(f"  PHAN B: DU BAO SOM {FORECAST_STEPS} BUOC ({FORECAST_STEPS*9.5/60:.1f} PHUT)")
     print("▓"*55)
 
     X_f, y_f, _ = preprocess(df, forecast_steps=FORECAST_STEPS)
@@ -274,7 +274,7 @@ def main():
 
     xgb_f, acc_f, f1_f = train_xgboost(
         X_tr_f_sm, X_te_f, y_tr_f_sm, y_te_f,
-        title_suffix="Du bao 5p")
+        title_suffix=f"Du bao {FORECAST_STEPS}buoc(~5p)")
 
     model_dict_5p = {
         'model'   : xgb_f,
@@ -290,8 +290,8 @@ def main():
     print(f"\n{'='*55}")
     print(f"  TONG KET")
     print(f"{'='*55}")
-    print(f"  [Hien tai]  Accuracy: {acc*100:.2f}%  F1: {f1*100:.2f}%")
-    print(f"  [Du bao 5p] Accuracy: {acc_f*100:.2f}%  F1: {f1_f*100:.2f}%")
+    print(f"  [Hien tai]     Accuracy: {acc*100:.2f}%  F1: {f1*100:.2f}%")
+    print(f"  [Du bao {FORECAST_STEPS}b~5p] Accuracy: {acc_f*100:.2f}%  F1: {f1_f*100:.2f}%")
     print(f"  Model luu : {MODEL_SAVE} + {MODEL_SAVE_5P}")
     print(f"\n  HOAN THANH!\n")
 
